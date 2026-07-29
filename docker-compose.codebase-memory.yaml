@@ -1,0 +1,103 @@
+#ddev-generated
+# Codebase Memory MCP server for DDEV
+# Runs the codebase-memory-mcp binary in its own container; AI agent containers
+# open an stdio MCP session over SSH (the binary has no HTTP transport).
+# Install: ddev add-on get IT-Cru/ddev-codebase-memory-mcp
+
+services:
+  codebase-memory:
+    container_name: ddev-${DDEV_SITENAME}-codebase-memory
+    hostname: codebase-memory
+    build:
+      context: .
+      dockerfile: codebase-memory-build/Dockerfile.codebase-memory
+      args:
+        USER_UID: ${DDEV_UID:-1000}
+        USER_GID: ${DDEV_GID:-1000}
+        CBM_VERSION: ${CBM_VERSION:-latest}
+        CBM_VARIANT: ${CBM_VARIANT:-ui}
+    labels:
+      com.ddev.site-name: ${DDEV_SITENAME}
+      com.ddev.approot: ${DDEV_APPROOT}
+    restart: "no"
+    user: "${DDEV_UID:-1000}:${DDEV_GID:-1000}"
+    working_dir: /var/www/html
+
+    volumes:
+      # Same mount point as the web and AI agent containers. This is required,
+      # not cosmetic: file paths stored in the graph are only meaningful to
+      # Claude Code / OpenCode if they resolve identically on both sides.
+      - ../:/var/www/html
+      # Persist the knowledge graph across restarts and rebuilds — a full
+      # re-index of a large repository is expensive.
+      - codebase-memory-cache:/home/cbm/.cache/codebase-memory-mcp
+      - ddev-global-cache:/mnt/ddev-global-cache
+
+    environment:
+      - DDEV_SITENAME
+      - IS_DDEV_PROJECT=true
+      - TZ=${TZ:-UTC}
+      - VIRTUAL_HOST=${DDEV_HOSTNAME}
+      # No HTTP_EXPOSE/HTTPS_EXPOSE for the graph UI: it enforces a
+      # localhost-only Host allowlist, so requests arriving through the DDEV
+      # router as https://<project>.ddev.site get a 403. `ddev cbm ui on`
+      # instead writes a docker-compose.codebase-memory-ui.yaml that publishes
+      # the port on host loopback, where the Host header is accepted.
+
+      # --- codebase-memory-mcp configuration ---
+      # One canonical cache root per container: every MCP session, CLI command
+      # and the daemon must agree on it, or CBM rejects the mismatch.
+      - CBM_CACHE_DIR=/home/cbm/.cache/codebase-memory-mcp
+      # Refuse to index anything outside the project. The server is driven by an
+      # AI agent, so the blast radius of a bad repo_path is worth bounding.
+      - CBM_ALLOWED_ROOT=/var/www/html
+      - CBM_UI=${CBM_UI:-false}
+      # CBM's own UI port (127.0.0.1-only), and the routable port the entrypoint
+      # bridges it onto for the DDEV router.
+      - CBM_UI_PORT=9749
+      - CBM_UI_BRIDGE_PORT=9748
+      - CBM_AUTO_INDEX=${CBM_AUTO_INDEX:-true}
+      - CBM_REGISTER_MCP=${CBM_REGISTER_MCP:-true}
+      # Optional tuning — passed through only when set in .ddev/.env.codebase-memory,
+      # so CBM applies its own detection by default.
+      - CBM_WORKERS
+      - CBM_MEM_BUDGET_MB
+      - CBM_LOG_LEVEL
+      - CBM_DIAGNOSTICS
+
+    # Idle container: MCP sessions arrive over SSH, one process per session.
+    command: ["sleep", "infinity"]
+    # Deliberately no `tty: true`: a TTY makes Docker emit a non-multiplexed log
+    # stream, which breaks `ddev logs -s codebase-memory` ("unrecognized stream")
+    # — and that is where first-run indexing progress is reported. Interactive
+    # use (`ddev cbm shell`) allocates its own TTY and is unaffected.
+
+    healthcheck:
+      # Both halves of the contract: the binary runs, and sshd accepts sessions.
+      test: ["CMD", "bash", "-c", "codebase-memory-mcp --version >/dev/null 2>&1 && exec 3<>/dev/tcp/127.0.0.1/22"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+    networks:
+      - default
+      - ddev_default
+
+    x-ddev:
+      describe-info: |
+        Codebase Memory MCP (knowledge graph, stdio over SSH)
+        Registered in: .mcp.json (Claude Code), opencode.json (OpenCode)
+        CLI: ddev cbm <tool>   |   Re-index: ddev cbm index
+        Graph UI: ddev cbm ui on
+
+networks:
+  ddev_default:
+    name: ddev_default
+    external: true
+
+volumes:
+  codebase-memory-cache:
+    name: ddev-${DDEV_SITENAME}-codebase-memory-cache
+  ddev-global-cache:
+    external: true

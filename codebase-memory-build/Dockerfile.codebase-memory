@@ -1,0 +1,142 @@
+#ddev-generated
+# Codebase Memory MCP container for DDEV
+# Ubuntu 24.04 + codebase-memory-mcp (static "portable" build) + sshd
+#
+# The MCP server speaks stdio only, so AI agent containers reach it the same way
+# they reach `web` and `beads`: over SSH, using the shared keypair in
+# .ddev/.agent-ssh-keys/. SSH pipes stdin/stdout verbatim, which is exactly what
+# an stdio MCP transport needs.
+
+FROM ubuntu:24.04
+
+ARG USERNAME=cbm
+ARG USER_UID
+ARG USER_GID
+
+# Release to install. "latest" tracks the newest GitHub release (a rebuild picks
+# up new versions); pin an exact tag (e.g. v0.9.0) for reproducible builds:
+#   ddev dotenv set .ddev/.env.codebase-memory --cbm-version=v0.9.0
+ARG CBM_VERSION=latest
+
+# "ui" also ships the graph visualization (~0.4 MB extra) so it can be enabled
+# at runtime without a rebuild. Use "default" for the plain server.
+ARG CBM_VARIANT=ui
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV USERNAME=${USERNAME}
+ENV USER_HOME=/home/${USERNAME}
+
+# jq: used by the entrypoint to merge MCP registrations into .mcp.json /
+# opencode.json. git: required by the detect_changes tool. zstd: for the
+# .codebase-memory/graph.db.zst shared-graph artifact.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    socat \
+    sudo \
+    zstd \
+    openssh-server \
+    && mkdir -p /var/run/sshd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the codebase-memory-mcp binary from GitHub Releases.
+#
+# Linux MUST use the "-portable" asset: the plain linux binary dynamically links
+# glibc 2.38+, while -portable is fully static. See upstream install.sh.
+#
+# The binary is placed directly on PATH rather than via `<binary> install`,
+# which would also rewrite agent configs and manage a host PATH we do not want
+# inside an image layer.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64|arm64) ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    if [ "${CBM_VARIANT}" = "ui" ]; then \
+      archive="codebase-memory-mcp-ui-linux-${arch}-portable.tar.gz"; \
+    else \
+      archive="codebase-memory-mcp-linux-${arch}-portable.tar.gz"; \
+    fi; \
+    if [ "${CBM_VERSION}" = "latest" ]; then \
+      base="https://github.com/DeusData/codebase-memory-mcp/releases/latest/download"; \
+    else \
+      base="https://github.com/DeusData/codebase-memory-mcp/releases/download/${CBM_VERSION}"; \
+    fi; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL --retry 3 --retry-delay 2 -o "${tmp}/${archive}" "${base}/${archive}"; \
+    curl -fsSL --retry 3 --retry-delay 2 -o "${tmp}/checksums.txt" "${base}/checksums.txt"; \
+    expected="$(awk -v a="${archive}" '$2 == a || $2 == "*"a {print $1}' "${tmp}/checksums.txt" | head -n1)"; \
+    if ! printf '%s' "${expected}" | grep -Eq '^[0-9a-fA-F]{64}$'; then \
+      echo "error: no valid SHA-256 digest for ${archive} in checksums.txt" >&2; exit 1; \
+    fi; \
+    echo "${expected}  ${tmp}/${archive}" | sha256sum -c -; \
+    tar -xzf "${tmp}/${archive}" -C "${tmp}"; \
+    install -m 0755 "${tmp}/codebase-memory-mcp" /usr/local/bin/codebase-memory-mcp; \
+    rm -rf "${tmp}"; \
+    codebase-memory-mcp --version
+
+# Create user with matching UID/GID from host (same approach as the sibling
+# AI add-ons, so files written into the bind-mounted project stay host-owned)
+RUN existing_user=$(getent passwd ${USER_UID} | cut -d: -f1) \
+    && existing_group=$(getent group ${USER_GID} | cut -d: -f1) \
+    && if [ -n "$existing_user" ] && [ "$existing_user" != "${USERNAME}" ]; then \
+         userdel -r $existing_user 2>/dev/null || true; \
+       fi \
+    && if [ -n "$existing_group" ] && [ "$existing_group" != "${USERNAME}" ]; then \
+         groupdel $existing_group 2>/dev/null || true; \
+       fi \
+    && groupadd --gid ${USER_GID} ${USERNAME} 2>/dev/null || true \
+    && useradd --uid ${USER_UID} --gid ${USER_GID} -m -s /bin/bash ${USERNAME} 2>/dev/null || true \
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/${USERNAME} \
+    && chmod 0440 /etc/sudoers.d/${USERNAME} \
+    && passwd -d ${USERNAME}
+
+# Configure sshd for AI container access (hardened, mirrors ddev-beads).
+# ForceCommand keeps the session pinned to the project root and sources the
+# DDEV environment, so `ssh cbm@codebase-memory codebase-memory-mcp` gets a
+# clean stdio pipe with CBM_* variables in place.
+RUN mkdir -p /etc/ssh/sshd_config.d && \
+    printf '#!/bin/bash\n. /etc/ddev-env 2>/dev/null\ncd /var/www/html\nif [ -n "$SSH_ORIGINAL_COMMAND" ]; then\n    eval "$SSH_ORIGINAL_COMMAND"\nelse\n    exec bash -l\nfi\n' \
+    > /usr/local/bin/ai-ssh-command.sh && chmod +x /usr/local/bin/ai-ssh-command.sh
+
+RUN printf '%s\n' \
+    'PermitRootLogin no' \
+    'PasswordAuthentication no' \
+    'PubkeyAuthentication yes' \
+    'UsePAM no' \
+    "AllowUsers ${USERNAME}" \
+    'AllowTcpForwarding no' \
+    'X11Forwarding no' \
+    '' \
+    "Match User ${USERNAME}" \
+    '    ForceCommand /usr/local/bin/ai-ssh-command.sh' \
+    > /etc/ssh/sshd_config.d/ai-agent.conf
+
+# The cache directory must exist *in the image* with the right ownership: Docker
+# seeds a fresh named volume from the image path, and would otherwise create it
+# root-owned and leave the unprivileged container user unable to write the graph.
+RUN mkdir -p /var/www/html ${USER_HOME}/.cache/codebase-memory-mcp \
+    && chown -R ${USER_UID}:${USER_GID} ${USER_HOME} \
+    && chown -R ${USER_UID}:${USER_GID} /var/www/html
+
+USER ${USERNAME}
+WORKDIR ${USER_HOME}
+
+# The bind-mounted project may be a git repo owned by a different UID than the
+# container user in some DDEV/host combinations; detect_changes shells out to
+# git, which refuses "dubious ownership" repositories.
+RUN git config --global --add safe.directory /var/www/html
+
+RUN echo 'alias ll="ls -la"' >> ~/.bashrc \
+    && echo 'echo "Codebase Memory MCP container ready"' >> ~/.bashrc \
+    && echo 'echo "  CLI: codebase-memory-mcp cli <tool> --help"' >> ~/.bashrc
+
+COPY codebase-memory-build/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN sudo chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+WORKDIR /var/www/html

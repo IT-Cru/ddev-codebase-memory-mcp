@@ -1,0 +1,136 @@
+name: codebase-memory-mcp
+
+ddev_version_constraint: '>= v1.24.10'
+
+# No hard dependencies: the SSH keypair this add-on needs is the same one
+# trebormc/ddev-ai-ssh uses, and whichever add-on installs first creates it.
+# That keeps the add-on usable standalone and composable with ddev-ai-workspace.
+dependencies: []
+
+pre_install_actions:
+  - |
+    #ddev-description:Checking platform support
+    # Upstream publishes linux binaries for amd64 and arm64 only.
+    arch="$(uname -m)"
+    case "$arch" in
+      x86_64|amd64|arm64|aarch64) ;;
+      *)
+        echo "codebase-memory-mcp has no Linux release for '$arch'."
+        echo "Supported: x86_64/amd64, arm64/aarch64."
+        exit 1
+        ;;
+    esac
+
+project_files:
+  - docker-compose.codebase-memory.yaml
+  # Directory form: everything under it belongs to this add-on, so removal takes
+  # the directory with it instead of leaving an empty shell behind.
+  - codebase-memory-build/
+  - commands/host/cbm
+
+global_files: []
+
+post_install_actions:
+  - |
+    #ddev-description:Generating SSH keys for agent access
+    # Identical path, filenames and permissions to trebormc/ddev-ai-ssh, so the
+    # two add-ons share one keypair in either installation order.
+    mkdir -p .agent-ssh-keys
+    if [ ! -f .agent-ssh-keys/id_ed25519 ]; then
+      ssh-keygen -t ed25519 -f .agent-ssh-keys/id_ed25519 -N "" -C "ddev-agent" >/dev/null 2>&1
+      chmod 600 .agent-ssh-keys/id_ed25519
+      chmod 644 .agent-ssh-keys/id_ed25519.pub
+      echo "Generated SSH keypair in .ddev/.agent-ssh-keys/"
+    else
+      echo "Reusing existing SSH keypair in .ddev/.agent-ssh-keys/"
+    fi
+    # Self-contained .gitignore — never touches the project's root .gitignore
+    cat > .agent-ssh-keys/.gitignore <<'EOF'
+    # Ignore everything in this directory
+    *
+    # Except this file
+    !.gitignore
+    EOF
+
+  - |
+    #ddev-description:Seeding .cbmignore
+    # Without this, DDEV's own config is indexed as if it were application code:
+    # the shell functions in this add-on's entrypoint.sh alone accounted for most
+    # of the Function nodes in a small test project. Only created when absent, so
+    # an existing .cbmignore is never touched.
+    if [ ! -e "${DDEV_APPROOT}/.cbmignore" ]; then
+      cat > "${DDEV_APPROOT}/.cbmignore" <<'EOF'
+    # codebase-memory-mcp ignore file (gitignore syntax).
+    # Created by the ddev-codebase-memory-mcp add-on; edit or delete as you like.
+
+    # DDEV configuration and add-on scripts are infrastructure, not application
+    # code — indexing them adds noise to every search and trace result.
+    .ddev/
+    EOF
+      echo "Created .cbmignore (excludes .ddev/ from the graph)"
+    else
+      echo "Kept existing .cbmignore — add '.ddev/' yourself to keep DDEV config out of the graph"
+    fi
+
+  - |
+    #ddev-description:Installation complete
+    echo ""
+    echo "=== Codebase Memory MCP installed ==="
+    echo ""
+    echo "Next step:"
+    echo "  ddev restart"
+    echo ""
+    echo "On first start the project is indexed in the background"
+    echo "(follow along with: ddev logs -f -s codebase-memory), and the server"
+    echo "is registered for both AI clients:"
+    echo "  .mcp.json      -> Claude Code   (ddev claude-code)"
+    echo "  opencode.json  -> OpenCode      (ddev opencode)"
+    echo ""
+    echo "Handy commands:"
+    echo "  ddev cbm index                 # re-index the project"
+    echo "  ddev cbm list_projects         # what is in the graph"
+    echo "  ddev cbm ui on                 # enable the graph UI, then restart"
+    echo "  ddev cbm --help                # all tools"
+    echo ""
+
+removal_actions:
+  - |
+    #ddev-description:Deregistering from AI client configs
+    # Remove only our own key, and only from valid JSON, so hand-added MCP
+    # servers in these shared files survive.
+    for f in "${DDEV_APPROOT}/.mcp.json:mcpServers" "${DDEV_APPROOT}/opencode.json:mcp"; do
+      file="${f%:*}"
+      key="${f##*:}"
+      if [ -s "$file" ] && jq -e 'type == "object"' "$file" >/dev/null 2>&1; then
+        if jq --arg k "$key" -e '.[$k]["codebase-memory"]' "$file" >/dev/null 2>&1; then
+          tmp="$(mktemp "${file}.XXXXXX")"
+          if jq --arg k "$key" 'del(.[$k]["codebase-memory"])' "$file" > "$tmp"; then
+            mv -f "$tmp" "$file"
+            echo "Removed 'codebase-memory' from $(basename "$file")"
+          else
+            rm -f "$tmp"
+          fi
+        fi
+      fi
+    done
+
+  - |
+    #ddev-description:Removing generated UI port mapping
+    # Written at runtime by `ddev cbm ui on`, so it is not in project_files and
+    # DDEV does not clean it up automatically.
+    UI_COMPOSE="${DDEV_APPROOT}/.ddev/docker-compose.codebase-memory-ui.yaml"
+    if [ -f "$UI_COMPOSE" ] && grep -q '#ddev-generated' "$UI_COMPOSE"; then
+      rm -f "$UI_COMPOSE"
+      echo "Removed generated graph UI port mapping"
+    fi
+
+  - |
+    #ddev-description:Cleaning up
+    echo ""
+    echo "Codebase Memory MCP add-on removed."
+    echo ""
+    echo "The knowledge graph volume was kept. Delete it with:"
+    echo "  docker volume rm ddev-${DDEV_SITENAME}-codebase-memory-cache"
+    echo ""
+    echo "The SSH keypair in .ddev/.agent-ssh-keys/ was kept (other AI add-ons use it)."
+    echo ""

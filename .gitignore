@@ -1,0 +1,8 @@
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code per-machine settings (contains local absolute paths)
+.claude/settings.local.json

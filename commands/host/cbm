@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+
+#ddev-generated
+## Description: Query the Codebase Memory knowledge graph (any MCP tool, from the CLI)
+## Usage: cbm [index|ui on|off|shell|logs|version|<tool> [flags]]
+## Example: "ddev cbm index" to (re)index, "ddev cbm list_projects", "ddev cbm search_graph --label Function --name-pattern '.*Handler.*'", "ddev cbm ui on" to enable the graph UI
+## ExecRaw: true
+
+set -eu -o pipefail
+
+SERVICE="codebase-memory"
+PROJECT_ROOT="/var/www/html"
+ENV_FILE="${DDEV_APPROOT}/.ddev/.env.${SERVICE}"
+UI_COMPOSE="${DDEV_APPROOT}/.ddev/docker-compose.${SERVICE}-ui.yaml"
+
+# `ddev exec` hands the command to a shell inside the container, so arguments
+# must be quoted or the shell rewrites them: a regex like '.*' would otherwise
+# glob-expand against the project directory before the tool ever sees it.
+#
+# stdin is closed because the CLI also accepts tool arguments as JSON on stdin:
+# with an inherited non-TTY stdin (any pipeline, script or CI job) it blocks
+# waiting for input that is never coming. Arguments are always passed as flags here.
+in_container() {
+  local cmd="" a
+  for a in "$@"; do
+    cmd="${cmd:+$cmd }$(printf '%q' "$a")"
+  done
+  ddev exec -s "${SERVICE}" bash -c "${cmd}" </dev/null
+}
+
+usage() {
+  cat <<'EOF'
+ddev cbm — Codebase Memory knowledge graph
+
+  ddev cbm index                 (Re)index this project into the graph
+  ddev cbm status                Indexing status of this project
+  ddev cbm list_projects         Projects in the graph, with node/edge counts
+  ddev cbm ui on [port] | off    Enable/disable the graph UI (needs a restart)
+  ddev cbm logs [-f]             Container logs (indexing progress lives here)
+  ddev cbm shell                 A shell inside the server container
+  ddev cbm version               Installed codebase-memory-mcp version
+
+  ddev cbm <tool> [flags]        Run any MCP tool as a one-shot command
+  ddev cbm <tool> --help         Flags for that tool
+
+Query tools take --project; it is filled in automatically when this project is
+the only one in the graph. Examples:
+
+  ddev cbm get_graph_schema
+  ddev cbm search_graph --label Function --name-pattern '.*Handler.*'
+  ddev cbm trace_path --function-name doSomething --direction both
+  ddev cbm get_architecture
+EOF
+}
+
+# Tools that operate on an already-indexed project need --project. Resolve it
+# from the graph so callers do not have to know the name CBM derived.
+resolve_project() {
+  in_container codebase-memory-mcp cli list_projects 2>/dev/null \
+    | jq -r '[.. | objects | select(has("name")) | .name] | .[0] // empty' 2>/dev/null \
+    || true
+}
+
+needs_project() {
+  case "$1" in
+    index_repository|list_projects|get_graph_schema) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+has_project_flag() {
+  for a in "$@"; do
+    case "$a" in --project|--project=*) return 0 ;; esac
+  done
+  return 1
+}
+
+case "${1:-}" in
+  ""|-h|--help|help)
+    usage
+    ;;
+
+  index)
+    shift
+    echo "Indexing ${PROJECT_ROOT} — this can take a while on a large repository."
+    # No --name: agent sessions auto-index under the path-derived name, so naming
+    # it anything else here just creates a second, redundant graph.
+    # Extra flags pass through, e.g. --persistence true, --mode fast.
+    in_container codebase-memory-mcp cli --progress index_repository \
+      --repo-path "${PROJECT_ROOT}" "$@"
+    ;;
+
+  status)
+    shift
+    project="$(resolve_project)"
+    if [ -n "${project}" ]; then
+      in_container codebase-memory-mcp cli index_status --project "${project}" "$@"
+    else
+      echo "Nothing indexed yet. Run: ddev cbm index" >&2
+      exit 1
+    fi
+    ;;
+
+  ui)
+    shift
+    case "${1:-}" in
+      on)
+        # The UI only answers requests whose Host is localhost/127.0.0.1, so it
+        # is published straight onto host loopback rather than routed through
+        # ddev-router under a *.ddev.site name (which it rejects with a 403).
+        #
+        # The port mapping goes in its own compose file that exists only while
+        # the UI is enabled: a published port that collides with something on the
+        # host fails `ddev start` outright, so an off switch must remove it
+        # entirely rather than leave it configured-but-empty.
+        host_port="${2:-9749}"
+        cat > "${UI_COMPOSE}" <<YAML
+#ddev-generated
+# Written by \`ddev cbm ui on\`. Remove with \`ddev cbm ui off\`.
+services:
+  ${SERVICE}:
+    ports:
+      - "127.0.0.1:${host_port}:9748"
+YAML
+        ddev dotenv set "${ENV_FILE}" --cbm-ui=true
+        echo "Graph UI enabled."
+        echo ""
+        echo "Run 'ddev restart', then open:"
+        echo "  http://127.0.0.1:${host_port}"
+        echo ""
+        echo "The UI is served by the coordination daemon, which lives only while"
+        echo "an MCP session is open — start one first (ddev claude-code /"
+        echo "ddev opencode), then load the URL."
+        echo ""
+        echo "If port ${host_port} is already taken on your host (codebase-memory-mcp"
+        echo "installed directly on the host also uses 9749): ddev cbm ui on <port>"
+        ;;
+      off)
+        rm -f "${UI_COMPOSE}"
+        ddev dotenv set "${ENV_FILE}" --cbm-ui=false
+        echo "Graph UI disabled. Run 'ddev restart' to apply."
+        ;;
+      *)
+        echo "Usage: ddev cbm ui on|off" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
+  logs)
+    shift
+    ddev logs -s "${SERVICE}" "$@"
+    ;;
+
+  shell|bash)
+    ddev ssh -s "${SERVICE}"
+    ;;
+
+  version)
+    in_container codebase-memory-mcp --version
+    ;;
+
+  *)
+    tool="$1"
+    shift
+    if needs_project "${tool}" && ! has_project_flag "$@"; then
+      project="$(resolve_project)"
+      if [ -n "${project}" ]; then
+        set -- --project "${project}" "$@"
+      fi
+    fi
+    in_container codebase-memory-mcp cli "${tool}" "$@"
+    ;;
+esac
