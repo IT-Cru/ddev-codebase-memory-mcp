@@ -25,19 +25,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV USERNAME=${USERNAME}
 ENV USER_HOME=/home/${USERNAME}
 
-# python3: runs the HTTP bridge — standard library only, no pip, no wheels, so
-#   nothing third-party sits between an agent and your source.
+# python3: runs the HTTP bridge and the graph UI reverse proxy — standard library
+#   only, no pip, no wheels, so nothing third-party sits between an agent and
+#   your source.
 # jq: the entrypoint merges MCP registrations into .mcp.json / opencode.json.
 # git: required by the detect_changes tool.
 # zstd: for the .codebase-memory/graph.db.zst shared-graph artifact.
-# socat: bridges the graph UI's 127.0.0.1-only listener when enabled.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     git \
     jq \
     python3 \
-    socat \
     sudo \
     zstd \
     && rm -rf /var/lib/apt/lists/*

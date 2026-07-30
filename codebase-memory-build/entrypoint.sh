@@ -22,8 +22,6 @@ ADDON_COMPOSE_FILE="${PROJECT_ROOT}/.ddev/docker-compose.codebase-memory.yaml"
 CBM_HTTP_HOST="${CBM_HTTP_HOST:-codebase-memory}"
 CBM_BRIDGE_PORT="${CBM_BRIDGE_PORT:-9750}"
 CBM_BRIDGE_PATH="${CBM_BRIDGE_PATH:-/mcp}"
-CBM_UI="${CBM_UI:-false}"
-CBM_UI_PORT="${CBM_UI_PORT:-9749}"
 CBM_REGISTER_MCP="${CBM_REGISTER_MCP:-true}"
 CBM_AUTO_INDEX="${CBM_AUTO_INDEX:-true}"
 
@@ -153,27 +151,10 @@ if [ "$CBM_AUTO_INDEX" = "true" ] && [ ! -f "$INDEX_SENTINEL" ]; then
   ) &
 fi
 
-# --- 3. Graph UI port forwarder (opt-in) ------------------------------------
-# codebase-memory-mcp binds its UI to 127.0.0.1 inside the container with no
-# option to change the bind address, so a published port mapping alone cannot
-# reach it. Bridge it onto the container's external interface on a second port;
-# `ddev cbm ui on` publishes that port to host loopback, where the UI's
-# localhost-only Host allowlist still accepts the request.
-#
-# The UI is owned by the coordination daemon, which lives only while at least one
-# MCP session is open: expect the URL to answer while an agent session is running.
-if [ "$CBM_UI" = "true" ]; then
-  (
-    while true; do
-      socat "TCP-LISTEN:${CBM_UI_BRIDGE_PORT:-9748},fork,reuseaddr,bind=0.0.0.0" \
-            "TCP:127.0.0.1:${CBM_UI_PORT}" 2>/dev/null
-      sleep 5
-    done
-  ) &
-  log "graph UI bridge listening on :${CBM_UI_BRIDGE_PORT:-9748} -> 127.0.0.1:${CBM_UI_PORT}"
-fi
-
-# --- 4. Serve MCP over HTTP -------------------------------------------------
+# --- 3. Serve MCP over HTTP -------------------------------------------------
+# The bridge also reverse-proxies the graph UI on CBM_UI_PROXY_PORT; no separate
+# forwarder is needed, and there is nothing to enable — the UI exists whenever an
+# MCP session is open.
 # exec so the bridge is PID 1: Docker signals reach it directly, and its exit
 # is the container's exit rather than being masked by a wrapper shell.
 log "serving MCP over HTTP at ${MCP_URL}"

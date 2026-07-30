@@ -166,21 +166,53 @@ teammates bootstrap from it instead of re-indexing from scratch. Add
 
 ### Graph UI
 
-```bash
-ddev cbm ui on        # optionally: ddev cbm ui on <port>
-ddev restart
+The graph visualization needs no setting up. Start an agent, then open:
+
+```
+http://<project>.ddev.site:9760      (or https on :9761)
 ```
 
-Then open <http://127.0.0.1:9749> while an agent session is running.
+```bash
+ddev cbm ui
+```
 
-The UI is served on host loopback and accepts only `localhost`/`127.0.0.1` as its
-`Host`, so use the address above rather than a `*.ddev.site` URL. It is owned by
-the coordination daemon, which exists only while at least one MCP session is open —
-start `ddev claude-code` or `ddev opencode` first, then load the page.
+prints that URL and whether it is currently up.
 
-Port `9749` is also the default for `codebase-memory-mcp` installed directly on
-your host. If it is taken, choose another with `ddev cbm ui on 9850`. `ddev cbm ui
-off` removes the port mapping again.
+The UI belongs to the coordination daemon, which exists only while at least one
+MCP session is open — so it answers while `ddev claude-code` or `ddev opencode` is
+running, and serves an explanatory page the rest of the time. There is nothing to
+enable or disable: with no session there is no daemon and no UI, and with a session
+the UI is already there.
+
+The bridge reverse-proxies it, rewriting the `Host` header on the way through.
+That is what makes a `*.ddev.site` URL work at all: `codebase-memory-mcp` binds the
+UI to loopback and refuses any `Host` other than `localhost`, as DNS-rebinding
+protection.
+
+> **Coming from a non-DDEV install?** Your own `codebase-memory-mcp` keeps serving
+> its graph on <http://localhost:9749> — that is untouched. A DDEV project's graph
+> is a *separate* index living in this container, published on `9760` precisely so
+> the two never collide. If you run both, `9749` is your machine's codebase and
+> `9760` is this project's.
+
+**Several projects at once work as you would expect.** `ddev-router` publishes
+`9760` once and routes by hostname, the same way it serves every project on `443`,
+so `projectA.ddev.site:9760` and `projectB.ddev.site:9760` each reach their own
+container and their own graph. Nothing needs a distinct port per project.
+
+A port clash is therefore only ever with a **non-DDEV** process on your host — a
+natively installed `codebase-memory-mcp` being the likely one. If `9760`/`9761` are
+taken, move them:
+
+```bash
+ddev dotenv set .ddev/.env.codebase-memory --cbm-ui-http-expose=9860:9760
+```
+
+Because the UI is reachable on the project's hostname, anything that can reach your
+DDEV router can browse the graph and call its `/api` endpoints — which include
+triggering a re-index and killing CBM processes. That is a deliberate trade for a
+local development tool; if it does not suit you, drop the `HTTP_EXPOSE` /
+`HTTPS_EXPOSE` lines from `docker-compose.codebase-memory.yaml`.
 
 ## Use with ddev-ai-workspace
 
@@ -239,9 +271,8 @@ ddev exec curl -sS -D /tmp/h -H 'Content-Type: application/json' -d '{"jsonrpc":
 | `HTTP 401` | `CBM_BRIDGE_TOKEN` is set but the client sends no matching bearer header |
 | Agent shows no `codebase-memory` tools | Entry missing from `.mcp.json` / `opencode.json` — `ddev restart`, and check `CBM_REGISTER_MCP` |
 | Empty query results | Index not finished. `ddev cbm logs`, or `ddev cbm index` |
-| Graph UI returns 403 | Reached via a `*.ddev.site` URL; use `http://127.0.0.1:<port>` |
-| Graph UI connection refused | No agent session open, so no daemon owns the UI |
-| `port is already allocated` on start | The UI port is taken. `ddev cbm ui on <other-port>` |
+| Graph UI says "not running" | No agent session open, so no daemon owns the UI — start `ddev claude-code` |
+| `port is already allocated` on start | `9760`/`9761` are taken; move them with `--cbm-ui-http-expose=` |
 
 Container logs, including indexing:
 
