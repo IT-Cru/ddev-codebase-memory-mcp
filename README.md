@@ -66,31 +66,42 @@ project is the only one in the graph.
 
 ## How it works
 
-`codebase-memory-mcp` speaks **stdio MCP only** — it has no HTTP transport (its
-`--port` flag serves the graph UI, not the protocol). So the agent containers reach
-it the same way they reach `web` and `beads`: over **SSH**, which pipes
-stdin/stdout verbatim — exactly what a stdio transport needs.
+`codebase-memory-mcp` speaks **stdio MCP only** — it has no HTTP transport of its
+own (its `--port` flag serves the graph UI, not the protocol). A small bridge
+shipped with this add-on puts MCP Streamable HTTP in front of it, so agents
+register it with a plain URL instead of a command:
 
 ```
-┌──────────────────┐   ssh (stdio JSON-RPC)   ┌────────────────────────┐
-│  claude-code     │ ───────────────────────► │  codebase-memory       │
-│  opencode        │                          │   sshd                 │
-│  (agent CLIs)    │                          │   codebase-memory-mcp  │
-└──────────────────┘                          │   graph cache (volume) │
-         │                                    └────────────────────────┘
-         └── project mounted at /var/www/html ──────────┘
+┌──────────────────┐    POST /mcp (JSON-RPC)   ┌───────────────────────────┐
+│  claude-code     │ ────────────────────────► │  codebase-memory          │
+│  opencode        │                           │   mcp-http-bridge.py :9750│
+│  (agent CLIs)    │                           │    ├─ codebase-memory-mcp │
+└──────────────────┘                           │    ├─ codebase-memory-mcp │
+         │                                     │    └─ …one per session    │
+         │                                     │   graph cache (volume)    │
+         └── project mounted at /var/www/html ──┴───────────────────────────┘
 ```
 
-Each agent session spawns its own `codebase-memory-mcp` process in the container;
-they share one coordination daemon and one graph cache.
+The bridge is ~300 lines of Python **standard library only** — no pip packages, so
+nothing third-party sits between an agent and your source. It speaks the parts of
+the transport this server needs and refuses the rest explicitly: `POST /mcp` for
+messages, `DELETE /mcp` to end a session, `GET /mcp` answers `405` (this server
+sends no server-initiated messages, so there is no SSE stream to open), and
+`GET /health` backs the container healthcheck.
+
+**Every MCP session gets its own `codebase-memory-mcp` process**, keyed by the
+`Mcp-Session-Id` header. This is the design's load-bearing property, not an
+optimization: a stdio pipe carries a single interleaved JSON-RPC stream plus
+per-session `initialize` state, so a shared child process would let two agents
+corrupt each other's traffic. All sessions share one coordination daemon and one
+graph cache. Idle sessions are reaped, and their child process with them.
 
 Both containers mount the project at the **same path** (`/var/www/html`), so the
 file paths stored in the graph resolve identically on both sides.
 
-Authentication uses the shared keypair in `.ddev/.agent-ssh-keys/` — the same one
-[ddev-ai-ssh](https://github.com/trebormc/ddev-ai-ssh) uses. Whichever add-on is
-installed first creates it, and `sshd` in the container is restricted to public-key
-auth with a forced command.
+The endpoint is published only on the project's Docker network, so there are no
+credentials to distribute. Set `CBM_BRIDGE_TOKEN` to require
+`Authorization: Bearer <token>` if you want it locked down anyway.
 
 ### What gets written to your project
 
@@ -99,7 +110,6 @@ auth with a forced command.
 | `.mcp.json` | Claude Code MCP registration (`codebase-memory` key only) |
 | `opencode.json` | OpenCode MCP registration (`codebase-memory` key only) |
 | `.cbmignore` | Excludes `.ddev/` from the graph — created only if absent |
-| `.ddev/.agent-ssh-keys/` | Shared agent keypair (self-gitignored) |
 
 Both JSON files are shared with other add-ons, so registration **merges**: other
 MCP servers, your `model` setting, and anything else you added are preserved, and
@@ -129,6 +139,9 @@ ddev dotenv set .ddev/.env.codebase-memory --cbm-workers=4
 | `CBM_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`, `none` |
 | `CBM_VERSION` | `latest` | Pin a release, e.g. `v0.9.0` (rebuild required) |
 | `CBM_VARIANT` | `ui` | `ui` or `default` (rebuild required) |
+| `CBM_BRIDGE_TOKEN` | *(unset)* | Require `Authorization: Bearer <token>` on the endpoint |
+| `CBM_BRIDGE_IDLE_TIMEOUT` | `1800` | Seconds before an idle session and its process are reaped |
+| `CBM_BRIDGE_REQUEST_TIMEOUT` | `900` | Ceiling for a single call; a full re-index can be slow |
 
 Indexing is bounded to the project by `CBM_ALLOWED_ROOT=/var/www/html`, so an agent
 cannot direct the indexer at arbitrary host paths.
@@ -177,10 +190,9 @@ ddev add-on get IT-Cru/ddev-codebase-memory-mcp
 ddev restart
 ```
 
-Either order works. This add-on has no dependency on the workspace: it shares the
-`.ddev/.agent-ssh-keys/` keypair with `ddev-ai-ssh`, whichever add-on creates it
-first, and registers itself in the project-root config files both clients already
-read.
+Either order works. This add-on has no dependency on the workspace — it only
+registers itself in the project-root config files both clients already read, the
+same way `ddev-playwright-mcp` does, and nothing owned by another add-on changes.
 
 If you install the workspace *after* this add-on, run `ddev restart` afterwards so
 the registration is re-checked.
@@ -208,16 +220,23 @@ Check the server is reachable exactly as an agent reaches it:
 ddev cbm version
 ```
 
-If an agent reports the MCP server failing to start, run the registered command by
-hand and read the error:
+Check the endpoint from another container, the way an agent reaches it:
 
 ```bash
-ddev exec bash -c "$(jq -r '.mcpServers["codebase-memory"] | ([.command] + .args) | @sh' .mcp.json)" </dev/null
+ddev exec curl -sS http://codebase-memory:9750/health
+```
+
+Open a real MCP session by hand — this is the whole handshake:
+
+```bash
+ddev exec curl -sS -D /tmp/h -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}' http://codebase-memory:9750/mcp
 ```
 
 | Symptom | Cause |
 |---------|-------|
-| `Permission denied (publickey)` | Missing keypair. Re-run `ddev add-on get`, then `ddev restart` |
+| `Connection refused` from an agent | Bridge not up. `ddev cbm logs`, check the container is healthy |
+| `HTTP 404` with `re-initialize` | Session expired or the container restarted; the client should re-initialize |
+| `HTTP 401` | `CBM_BRIDGE_TOKEN` is set but the client sends no matching bearer header |
 | Agent shows no `codebase-memory` tools | Entry missing from `.mcp.json` / `opencode.json` — `ddev restart`, and check `CBM_REGISTER_MCP` |
 | Empty query results | Index not finished. `ddev cbm logs`, or `ddev cbm index` |
 | Graph UI returns 403 | Reached via a `*.ddev.site` URL; use `http://127.0.0.1:<port>` |
@@ -237,8 +256,8 @@ ddev add-on remove codebase-memory-mcp
 ```
 
 This deregisters the server from both config files and removes the add-on's files.
-The graph cache volume and the shared SSH keypair are kept on purpose — other AI
-add-ons use the keypair, and re-indexing is expensive. To drop the cache:
+The graph cache volume is kept on purpose, because re-indexing is expensive. To
+drop it:
 
 ```bash
 docker volume rm ddev-<project>-codebase-memory-cache

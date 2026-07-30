@@ -1,11 +1,10 @@
 #ddev-generated
 # Codebase Memory MCP container for DDEV
-# Ubuntu 24.04 + codebase-memory-mcp (static "portable" build) + sshd
+# Ubuntu 24.04 + codebase-memory-mcp (static "portable" build) + HTTP bridge
 #
-# The MCP server speaks stdio only, so AI agent containers reach it the same way
-# they reach `web` and `beads`: over SSH, using the shared keypair in
-# .ddev/.agent-ssh-keys/. SSH pipes stdin/stdout verbatim, which is exactly what
-# an stdio MCP transport needs.
+# The MCP server speaks stdio only, so it cannot be registered with a URL. A
+# small stdlib-only Python bridge (mcp-http-bridge.py) puts MCP Streamable HTTP
+# in front of it and gives each MCP session its own child process.
 
 FROM ubuntu:24.04
 
@@ -26,20 +25,27 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV USERNAME=${USERNAME}
 ENV USER_HOME=/home/${USERNAME}
 
-# jq: used by the entrypoint to merge MCP registrations into .mcp.json /
-# opencode.json. git: required by the detect_changes tool. zstd: for the
-# .codebase-memory/graph.db.zst shared-graph artifact.
+# python3: runs the HTTP bridge — standard library only, no pip, no wheels, so
+#   nothing third-party sits between an agent and your source.
+# jq: the entrypoint merges MCP registrations into .mcp.json / opencode.json.
+# git: required by the detect_changes tool.
+# zstd: for the .codebase-memory/graph.db.zst shared-graph artifact.
+# socat: bridges the graph UI's 127.0.0.1-only listener when enabled.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     git \
     jq \
+    python3 \
     socat \
     sudo \
     zstd \
-    openssh-server \
-    && mkdir -p /var/run/sshd \
     && rm -rf /var/lib/apt/lists/*
+
+# Fail the build here rather than at runtime if the base image ever ships a
+# Python without these modules.
+RUN python3 -c "import http.server, json, queue, subprocess, threading, uuid, socketserver" \
+    && python3 --version
 
 # Install the codebase-memory-mcp binary from GitHub Releases.
 #
@@ -94,33 +100,19 @@ RUN existing_user=$(getent passwd ${USER_UID} | cut -d: -f1) \
     && chmod 0440 /etc/sudoers.d/${USERNAME} \
     && passwd -d ${USERNAME}
 
-# Configure sshd for AI container access (hardened, mirrors ddev-beads).
-# ForceCommand keeps the session pinned to the project root and sources the
-# DDEV environment, so `ssh cbm@codebase-memory codebase-memory-mcp` gets a
-# clean stdio pipe with CBM_* variables in place.
-RUN mkdir -p /etc/ssh/sshd_config.d && \
-    printf '#!/bin/bash\n. /etc/ddev-env 2>/dev/null\ncd /var/www/html\nif [ -n "$SSH_ORIGINAL_COMMAND" ]; then\n    eval "$SSH_ORIGINAL_COMMAND"\nelse\n    exec bash -l\nfi\n' \
-    > /usr/local/bin/ai-ssh-command.sh && chmod +x /usr/local/bin/ai-ssh-command.sh
-
-RUN printf '%s\n' \
-    'PermitRootLogin no' \
-    'PasswordAuthentication no' \
-    'PubkeyAuthentication yes' \
-    'UsePAM no' \
-    "AllowUsers ${USERNAME}" \
-    'AllowTcpForwarding no' \
-    'X11Forwarding no' \
-    '' \
-    "Match User ${USERNAME}" \
-    '    ForceCommand /usr/local/bin/ai-ssh-command.sh' \
-    > /etc/ssh/sshd_config.d/ai-agent.conf
-
 # The cache directory must exist *in the image* with the right ownership: Docker
 # seeds a fresh named volume from the image path, and would otherwise create it
 # root-owned and leave the unprivileged container user unable to write the graph.
 RUN mkdir -p /var/www/html ${USER_HOME}/.cache/codebase-memory-mcp \
     && chown -R ${USER_UID}:${USER_GID} ${USER_HOME} \
     && chown -R ${USER_UID}:${USER_GID} /var/www/html
+
+# Copied as root so no in-container privilege escalation is needed to make them
+# executable.
+COPY codebase-memory-build/mcp-http-bridge.py /usr/local/bin/mcp-http-bridge.py
+COPY codebase-memory-build/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/mcp-http-bridge.py /usr/local/bin/entrypoint.sh \
+    && python3 -m py_compile /usr/local/bin/mcp-http-bridge.py
 
 USER ${USERNAME}
 WORKDIR ${USER_HOME}
@@ -133,9 +125,6 @@ RUN git config --global --add safe.directory /var/www/html
 RUN echo 'alias ll="ls -la"' >> ~/.bashrc \
     && echo 'echo "Codebase Memory MCP container ready"' >> ~/.bashrc \
     && echo 'echo "  CLI: codebase-memory-mcp cli <tool> --help"' >> ~/.bashrc
-
-COPY codebase-memory-build/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN sudo chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 

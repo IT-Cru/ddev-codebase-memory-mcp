@@ -1,7 +1,7 @@
 #ddev-generated
 # Codebase Memory MCP server for DDEV
-# Runs the codebase-memory-mcp binary in its own container; AI agent containers
-# open an stdio MCP session over SSH (the binary has no HTTP transport).
+# Runs the codebase-memory-mcp binary in its own container, behind a small
+# stdio->Streamable HTTP bridge, so agents register it with a plain URL.
 # Install: ddev add-on get IT-Cru/ddev-codebase-memory-mcp
 
 services:
@@ -58,6 +58,15 @@ services:
       - CBM_UI_BRIDGE_PORT=9748
       - CBM_AUTO_INDEX=${CBM_AUTO_INDEX:-true}
       - CBM_REGISTER_MCP=${CBM_REGISTER_MCP:-true}
+      # --- HTTP bridge ---
+      # Reachable as http://codebase-memory:9750/mcp on the project network.
+      - CBM_BRIDGE_PORT=9750
+      - CBM_BRIDGE_PATH=/mcp
+      # Optional shared secret. When set, the bridge requires
+      # `Authorization: Bearer <token>`; both clients support custom headers.
+      - CBM_BRIDGE_TOKEN
+      - CBM_BRIDGE_IDLE_TIMEOUT
+      - CBM_BRIDGE_REQUEST_TIMEOUT
       # Optional tuning — passed through only when set in .ddev/.env.codebase-memory,
       # so CBM applies its own detection by default.
       - CBM_WORKERS
@@ -65,16 +74,18 @@ services:
       - CBM_LOG_LEVEL
       - CBM_DIAGNOSTICS
 
-    # Idle container: MCP sessions arrive over SSH, one process per session.
-    command: ["sleep", "infinity"]
+    # The entrypoint execs the HTTP bridge, which is the long-running process.
     # Deliberately no `tty: true`: a TTY makes Docker emit a non-multiplexed log
     # stream, which breaks `ddev logs -s codebase-memory` ("unrecognized stream")
     # — and that is where first-run indexing progress is reported. Interactive
     # use (`ddev cbm shell`) allocates its own TTY and is unaffected.
 
+    expose:
+      - "9750"
+
     healthcheck:
-      # Both halves of the contract: the binary runs, and sshd accepts sessions.
-      test: ["CMD", "bash", "-c", "codebase-memory-mcp --version >/dev/null 2>&1 && exec 3<>/dev/tcp/127.0.0.1/22"]
+      # Both halves of the contract: the binary runs, and the bridge serves HTTP.
+      test: ["CMD", "bash", "-c", "codebase-memory-mcp --version >/dev/null 2>&1 && curl -fsS http://127.0.0.1:9750/health >/dev/null"]
       interval: 15s
       timeout: 10s
       retries: 5
@@ -86,7 +97,8 @@ services:
 
     x-ddev:
       describe-info: |
-        Codebase Memory MCP (knowledge graph, stdio over SSH)
+        Codebase Memory MCP (knowledge graph, Streamable HTTP)
+        Endpoint: http://codebase-memory:9750/mcp (project network)
         Registered in: .mcp.json (Claude Code), opencode.json (OpenCode)
         CLI: ddev cbm <tool>   |   Re-index: ddev cbm index
         Graph UI: ddev cbm ui on
