@@ -9,7 +9,28 @@ permissions:
   contents: write
 
 jobs:
+  # Gate the release on the bridge tests. A tag push does not run the `tests`
+  # workflow (that one triggers on pull_request and pushes to main), so without
+  # this a release could be cut from code whose protocol tests never ran.
+  bridge:
+    name: bridge unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the python3 in the add-on's ubuntu:24.04 image.
+          python-version: '3.12'
+
+      - name: Byte-compile the bridge
+        run: python3 -m py_compile codebase-memory-build/mcp-http-bridge.py
+
+      - name: Run bridge tests
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests/bridge -v
+
   release:
+    needs: bridge
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
