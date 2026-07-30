@@ -27,6 +27,35 @@ permissions:
   contents: read
 
 jobs:
+  # The HTTP bridge is the one piece of protocol code this add-on owns, so it gets
+  # its own fast check: standard library only, no Docker and no DDEV, so it runs in
+  # seconds and gives a clear signal well before the add-on job finishes.
+  bridge:
+    name: bridge unit tests (python ${{ matrix.python_version }})
+    strategy:
+      matrix:
+        # 3.12 is what ubuntu:24.04 ships and therefore what actually runs in the
+        # container; the neighbours guard against drift if that base image moves.
+        python_version: ['3.11', '3.12', '3.13']
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+
+      - name: Byte-compile the bridge
+        run: python3 -m py_compile codebase-memory-build/mcp-http-bridge.py
+
+      - name: Run bridge tests
+        # Fail on ResourceWarning: leaked pipes or sockets in the bridge would
+        # otherwise pass silently and only show up as exhaustion under load.
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests/bridge -v
+
   tests:
     strategy:
       matrix:

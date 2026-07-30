@@ -2,9 +2,9 @@ name: codebase-memory-mcp
 
 ddev_version_constraint: '>= v1.24.10'
 
-# No hard dependencies: the SSH keypair this add-on needs is the same one
-# trebormc/ddev-ai-ssh uses, and whichever add-on installs first creates it.
-# That keeps the add-on usable standalone and composable with ddev-ai-workspace.
+# No dependencies and no credentials to distribute: the server is reached over
+# HTTP on the project's Docker network, so this composes with ddev-ai-workspace
+# without touching anything another add-on owns.
 dependencies: []
 
 pre_install_actions:
@@ -31,27 +31,6 @@ project_files:
 global_files: []
 
 post_install_actions:
-  - |
-    #ddev-description:Generating SSH keys for agent access
-    # Identical path, filenames and permissions to trebormc/ddev-ai-ssh, so the
-    # two add-ons share one keypair in either installation order.
-    mkdir -p .agent-ssh-keys
-    if [ ! -f .agent-ssh-keys/id_ed25519 ]; then
-      ssh-keygen -t ed25519 -f .agent-ssh-keys/id_ed25519 -N "" -C "ddev-agent" >/dev/null 2>&1
-      chmod 600 .agent-ssh-keys/id_ed25519
-      chmod 644 .agent-ssh-keys/id_ed25519.pub
-      echo "Generated SSH keypair in .ddev/.agent-ssh-keys/"
-    else
-      echo "Reusing existing SSH keypair in .ddev/.agent-ssh-keys/"
-    fi
-    # Self-contained .gitignore — never touches the project's root .gitignore
-    cat > .agent-ssh-keys/.gitignore <<'EOF'
-    # Ignore everything in this directory
-    *
-    # Except this file
-    !.gitignore
-    EOF
-
   - |
     #ddev-description:Seeding .cbmignore
     # Without this, DDEV's own config is indexed as if it were application code:
@@ -131,6 +110,4 @@ removal_actions:
     echo ""
     echo "The knowledge graph volume was kept. Delete it with:"
     echo "  docker volume rm ddev-${DDEV_SITENAME}-codebase-memory-cache"
-    echo ""
-    echo "The SSH keypair in .ddev/.agent-ssh-keys/ was kept (other AI add-ons use it)."
     echo ""

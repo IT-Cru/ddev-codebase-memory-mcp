@@ -6,3 +6,7 @@
 
 # Claude Code per-machine settings (contains local absolute paths)
 .claude/settings.local.json
+
+# Python bytecode (py_compile / local bridge runs)
+__pycache__/
+*.pyc

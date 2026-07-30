@@ -4,24 +4,24 @@
 # =============================================================================
 # Codebase Memory MCP — DDEV entrypoint
 #
-#   1. Publish the SSH host so agent containers can open an stdio MCP pipe
-#   2. Register the server in .mcp.json (Claude Code) and opencode.json (OpenCode)
-#   3. Index the project once, in the background
+#   1. Register the server in .mcp.json (Claude Code) and opencode.json (OpenCode)
+#   2. Index the project once, in the background
+#   3. Optionally bridge the graph UI onto a routable port
+#   4. Exec the MCP Streamable HTTP bridge as the container's main process
 #
-# The MCP server itself is not started here. It is spawned per session by the
-# agent, over SSH — one `codebase-memory-mcp` process per client session, all
-# sharing this container's coordination daemon and graph cache.
+# The bridge spawns one codebase-memory-mcp process per MCP session, all sharing
+# this container's coordination daemon and graph cache.
 # =============================================================================
 
 set -uo pipefail
 
 PROJECT_ROOT="/var/www/html"
-SSH_KEY_DIR="${PROJECT_ROOT}/.ddev/.agent-ssh-keys"
 # Presence of this file is how the container knows it is still installed:
 # `ddev add-on remove` deletes it, but leaves this container running.
 ADDON_COMPOSE_FILE="${PROJECT_ROOT}/.ddev/docker-compose.codebase-memory.yaml"
-CBM_SSH_USER="${USERNAME:-cbm}"
-CBM_SSH_HOST="${CBM_SSH_HOST:-codebase-memory}"
+CBM_HTTP_HOST="${CBM_HTTP_HOST:-codebase-memory}"
+CBM_BRIDGE_PORT="${CBM_BRIDGE_PORT:-9750}"
+CBM_BRIDGE_PATH="${CBM_BRIDGE_PATH:-/mcp}"
 CBM_UI="${CBM_UI:-false}"
 CBM_UI_PORT="${CBM_UI_PORT:-9749}"
 CBM_REGISTER_MCP="${CBM_REGISTER_MCP:-true}"
@@ -29,53 +29,14 @@ CBM_AUTO_INDEX="${CBM_AUTO_INDEX:-true}"
 
 log() { echo "[codebase-memory] $*"; }
 
-# --- 1. SSH server for AI container access ----------------------------------
-if [ -f "${SSH_KEY_DIR}/id_ed25519.pub" ]; then
-  mkdir -p ~/.ssh && chmod 700 ~/.ssh
-  cp "${SSH_KEY_DIR}/id_ed25519.pub" ~/.ssh/authorized_keys
-  chmod 600 ~/.ssh/authorized_keys
-else
-  log "WARNING: ${SSH_KEY_DIR}/id_ed25519.pub not found — agent containers cannot connect."
-  log "         Reinstall the add-on, or run: ddev add-on get trebormc/ddev-ai-ssh"
-fi
-
-# Save the environment for SSH sessions. CBM_* must be included: the MCP server
-# is spawned through ForceCommand, which starts from a bare sshd environment,
-# so the cache root / allowed root / tuning knobs would otherwise be lost and
-# the session would use a different cache root than the daemon.
-env | grep -E '^(DDEV_|IS_DDEV_PROJECT|HOME=|PATH=|LANG|TZ=|CBM_)' \
-    | sed 's/^/export /' | sudo tee /etc/ddev-env > /dev/null
-sudo chmod 644 /etc/ddev-env
-sudo /usr/sbin/sshd 2>/dev/null || true
-
-# --- 2. Register the MCP server with the AI clients -------------------------
+# --- 1. Register the MCP server with the AI clients -------------------------
 # Both files live in the project root and are read natively by their client:
 # Claude Code reads .mcp.json, OpenCode merges a project-level opencode.json on
 # top of its global config. Only our own key is ever touched.
-
-# SSH options for a long-lived, non-interactive, machine-readable pipe.
-# -T: no pty (a pty would mangle the JSON-RPC stream)
-# LogLevel=ERROR + -q: keep SSH chatter off the MCP stderr channel
-# ServerAlive*: hold the pipe open across idle stretches in a long session
-build_ssh_args() {
-  local key="${SSH_KEY_DIR}/id_ed25519"
-  MCP_ARGS=(
-    -T -q
-    -i "$key"
-    -o StrictHostKeyChecking=no
-    -o UserKnownHostsFile=/dev/null
-    -o BatchMode=yes
-    -o LogLevel=ERROR
-    -o ConnectTimeout=10
-    -o ServerAliveInterval=30
-    -o ServerAliveCountMax=3
-    "${CBM_SSH_USER}@${CBM_SSH_HOST}"
-    codebase-memory-mcp
-  )
-  # No --ui flag here: the UI setting is persisted server-side config, not a
-  # per-session option, and the "ui" build serves it by default. Reaching it
-  # from outside the container is a port-forwarding problem, handled below.
-}
+#
+# The URL resolves on the project's Docker network, so any container in the
+# project can reach it with no credentials to distribute.
+MCP_URL="http://${CBM_HTTP_HOST}:${CBM_BRIDGE_PORT}${CBM_BRIDGE_PATH}"
 
 atomic_write() {
   # $1 = destination, stdin = content. Same-directory temp keeps it a rename.
@@ -89,8 +50,7 @@ atomic_write() {
 register_claude_code() {
   local file="${PROJECT_ROOT}/.mcp.json"
   local desired current
-  desired="$(jq -n --argjson args "$ARGS_JSON" \
-    '{type: "stdio", command: "ssh", args: $args}')" || return 1
+  desired="$(jq -n --arg url "$MCP_URL" '{type: "http", url: $url}')" || return 1
 
   if [ -s "$file" ] && jq -e 'type == "object"' "$file" >/dev/null 2>&1; then
     current="$(jq -c '.mcpServers["codebase-memory"] // null' "$file")"
@@ -110,9 +70,9 @@ register_claude_code() {
 register_opencode() {
   local file="${PROJECT_ROOT}/opencode.json"
   local desired current
-  # OpenCode's stdio transport is type "local", with argv as a single array.
-  desired="$(jq -n --argjson args "$ARGS_JSON" \
-    '{type: "local", command: (["ssh"] + $args), enabled: true}')" || return 1
+  # OpenCode calls an HTTP MCP server "remote".
+  desired="$(jq -n --arg url "$MCP_URL" \
+    '{type: "remote", url: $url, enabled: true}')" || return 1
 
   if [ -s "$file" ] && jq -e 'type == "object"' "$file" >/dev/null 2>&1; then
     current="$(jq -c '.mcp["codebase-memory"] // null' "$file")"
@@ -133,15 +93,13 @@ register_opencode() {
 register_all() {
   register_claude_code; local cc=$?
   register_opencode;    local oc=$?
-  [ $cc -eq 0 ] && log "registered in .mcp.json (Claude Code)"
-  [ $oc -eq 0 ] && log "registered in opencode.json (OpenCode)"
+  [ $cc -eq 0 ] && log "registered in .mcp.json (Claude Code) -> ${MCP_URL}"
+  [ $oc -eq 0 ] && log "registered in opencode.json (OpenCode) -> ${MCP_URL}"
   # 2 means "already present and current"
   { [ $cc -eq 0 ] || [ $cc -eq 2 ]; } && { [ $oc -eq 0 ] || [ $oc -eq 2 ]; }
 }
 
 if [ "$CBM_REGISTER_MCP" = "true" ]; then
-  build_ssh_args
-  ARGS_JSON="$(printf '%s\n' "${MCP_ARGS[@]}" | jq -R . | jq -sc .)"
   register_all
 
   # Sibling AI add-ons rewrite .mcp.json from their own entrypoints at the same
@@ -160,7 +118,7 @@ if [ "$CBM_REGISTER_MCP" = "true" ]; then
   ) &
 fi
 
-# --- 3. Keep the graph fresh -------------------------------------------------
+# --- 2. Keep the graph fresh -------------------------------------------------
 # CBM's own auto_index defaults to false, and its file watcher only sees changes
 # while a session is open. In a DDEV project plenty happens with no agent
 # attached (git pull, composer install, a branch switch), so without this the
@@ -174,9 +132,8 @@ else
   codebase-memory-mcp config set auto_index false >/dev/null 2>&1 || true
 fi
 
-# --- 3b. First-time indexing (background) -----------------------------------
-# CBM keeps the graph fresh automatically after the initial index, so this runs
-# once per cache volume. `ddev cbm index` forces a re-index at any time.
+# --- 2b. First-time indexing (background) -----------------------------------
+# Runs once per cache volume; `ddev cbm index` forces a re-index at any time.
 # CLI mode neither starts nor joins the coordination daemon, and takes per-project
 # locks, so it is safe alongside live agent sessions.
 INDEX_SENTINEL="${CBM_CACHE_DIR:-${HOME}/.cache/codebase-memory-mcp}/.ddev-auto-indexed"
@@ -196,7 +153,7 @@ if [ "$CBM_AUTO_INDEX" = "true" ] && [ ! -f "$INDEX_SENTINEL" ]; then
   ) &
 fi
 
-# --- 4. Graph UI port forwarder (opt-in) ------------------------------------
+# --- 3. Graph UI port forwarder (opt-in) ------------------------------------
 # codebase-memory-mcp binds its UI to 127.0.0.1 inside the container with no
 # option to change the bind address, so a published port mapping alone cannot
 # reach it. Bridge it onto the container's external interface on a second port;
@@ -216,4 +173,8 @@ if [ "$CBM_UI" = "true" ]; then
   log "graph UI bridge listening on :${CBM_UI_BRIDGE_PORT:-9748} -> 127.0.0.1:${CBM_UI_PORT}"
 fi
 
-exec "$@"
+# --- 4. Serve MCP over HTTP -------------------------------------------------
+# exec so the bridge is PID 1: Docker signals reach it directly, and its exit
+# is the container's exit rather than being masked by a wrapper shell.
+log "serving MCP over HTTP at ${MCP_URL}"
+exec python3 -u /usr/local/bin/mcp-http-bridge.py

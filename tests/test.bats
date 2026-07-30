@@ -12,16 +12,41 @@
 # For debugging:
 #   bats ./tests/test.bats --show-output-of-passing-tests --verbose-run --print-output-on-failure
 
-# `ddev delete` returns before Docker has finished removing the containers. Every
-# test reuses the same project name, so starting the next one too soon fails with
-# "container ... is marked for removal and cannot be connected to the network".
+# `ddev delete` returns before Docker has finished tearing the project down, and
+# every test reuses the same project name. Starting too soon fails in more than one
+# way — "container ... is marked for removal", or "network ... has active
+# endpoints" when a container is gone from `ps` but its network endpoint has not
+# detached yet — so wait for both the containers and the project network.
 wait_for_project_removal() {
   local tries=0
-  while [ "${tries}" -lt 60 ] \
-        && [ -n "$(docker ps -aq --filter "name=ddev-${PROJNAME}-" 2>/dev/null)" ]; do
+  while [ "${tries}" -lt 60 ]; do
+    if [ -z "$(docker ps -aq --filter "name=ddev-${PROJNAME}-" 2>/dev/null)" ] \
+       && [ -z "$(docker network ls -q --filter "name=ddev-${PROJNAME}_default" 2>/dev/null)" ]; then
+      return 0
+    fi
     sleep 1
     tries=$((tries + 1))
   done
+}
+
+# Even with that wait, Docker teardown is eventually-consistent enough that a
+# start can still lose a race. Retry a bounded number of times instead of trying
+# to enumerate every failure mode; `ddev poweroff` is the documented way to clear
+# stale ddev networks and endpoints. Note it stops other ddev projects too, but it
+# only runs when a start has already failed.
+ddev_start_with_retry() {
+  local attempt
+  for attempt in 1 2; do
+    if ddev start -y >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "# ddev start attempt ${attempt} failed; poweroff and retry" >&3
+    ddev poweroff >/dev/null 2>&1 || true
+    wait_for_project_removal
+    sleep 5
+  done
+  # Final attempt with output visible, so a real failure is reported properly.
+  ddev start -y
 }
 
 setup() {
@@ -41,7 +66,12 @@ setup() {
   export TESTDIR="$(mktemp -d "${HOME}/tmp/${PROJNAME}.XXXXXX")"
   export DDEV_NONINTERACTIVE=true
   export DDEV_NO_INSTRUMENTATION=true
+  # A project of this name may survive an earlier run, and `mktemp` means it is
+  # registered against a *different* directory. ddev then refuses to work here
+  # with "a project ... already exists ... that was created at <other path>", so
+  # clear the registration by name — not by path — before configuring this one.
   ddev delete -Oy "${PROJNAME}" >/dev/null 2>&1 || true
+  ddev stop -U "${PROJNAME}" >/dev/null 2>&1 || true
   wait_for_project_removal
   cd "${TESTDIR}"
 
@@ -65,7 +95,7 @@ JSEOF
 
   run ddev config --project-name="${PROJNAME}" --project-tld=ddev.site --docroot=.
   assert_success
-  run ddev start -y
+  run ddev_start_with_retry
   assert_success
 }
 
@@ -82,20 +112,45 @@ teardown() {
   fi
 }
 
-export INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bats","version":"1"}}}'
-
-# Open a real MCP session the way an agent container does: read the registered
-# ssh command straight out of .mcp.json and feed JSON-RPC lines into it.
+# Open a real MCP session over Streamable HTTP the way an agent container does:
+# use the URL exactly as registered in .mcp.json (so the assertion covers the
+# registration being usable, not just well-formed), initialize to get a session
+# id, then run any further JSON-RPC bodies passed as arguments.
+#
+# Driven from the web container: a different container on the same project
+# network, which is the situation the agent containers are in. The probe is
+# `docker cp`-ed rather than written into the project, so it does not depend on
+# a mutagen sync landing first.
 mcp_session() {
-  local cmd
-  cmd="$(jq -r '.mcpServers["codebase-memory"] | ([.command] + .args) | @sh' "${TESTDIR}/.mcp.json")"
-  printf '%s\n' "$@" | ddev exec bash -c "${cmd}" 2>/dev/null
+  local url probe
+  url="$(jq -r '.mcpServers["codebase-memory"].url' "${TESTDIR}/.mcp.json")"
+  probe="$(mktemp)"
+  cat > "${probe}" <<'PROBE'
+set -u
+URL="$1"; shift
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bats","version":"1"}}}'
+curl -sS -D /tmp/mcp-hdr -H 'Content-Type: application/json' -d "$INIT" "$URL"
+SID="$(grep -i '^Mcp-Session-Id:' /tmp/mcp-hdr | tr -d '\r' | awk '{print $2}')"
+[ -n "$SID" ] || { echo "no session id returned" >&2; exit 1; }
+for body in "$@"; do
+  curl -sS -H 'Content-Type: application/json' -H "Mcp-Session-Id: $SID" -d "$body" "$URL"
+done
+PROBE
+  docker cp "${probe}" "ddev-${PROJNAME}-web:/tmp/mcp-probe.sh" >/dev/null 2>&1
+  rm -f "${probe}"
+  ddev exec bash /tmp/mcp-probe.sh "${url}" "$@" 2>/dev/null
+}
+
+# Count live stdio server processes inside the add-on's container.
+count_server_processes() {
+  docker exec "ddev-${PROJNAME}-codebase-memory" \
+    bash -c 'ps -eo args | grep -c "^codebase-memory-mcp$"' 2>/dev/null || echo 0
 }
 
 # Wait for the container entrypoint to register the server with both clients.
-# A healthy container is not sufficient: the healthcheck covers the binary and
-# sshd, both of which come up before registration runs. On macOS the file also
-# has to sync from the container back to the host before these assertions see it.
+# A healthy container is not sufficient: registration happens before the HTTP
+# bridge is exec'd, and on macOS the file also has to sync from the container
+# back to the host before these assertions can see it.
 wait_for_registration() {
   local tries=0
   until [ "${tries}" -ge 30 ]; do
@@ -135,37 +190,43 @@ health_checks() {
 
   wait_for_registration
 
-  # Registered for Claude Code, as an stdio server reached over SSH
+  # Registered for Claude Code as an HTTP server
   assert_file_exist "${TESTDIR}/.mcp.json"
-  run jq -r '.mcpServers["codebase-memory"].command' "${TESTDIR}/.mcp.json"
+  run jq -r '.mcpServers["codebase-memory"].type' "${TESTDIR}/.mcp.json"
   assert_success
-  assert_output "ssh"
+  assert_output "http"
+  run jq -r '.mcpServers["codebase-memory"].url' "${TESTDIR}/.mcp.json"
+  assert_success
+  assert_output "http://codebase-memory:9750/mcp"
 
-  # Registered for OpenCode, whose stdio transport is type "local"
+  # Registered for OpenCode, which calls an HTTP MCP server "remote"
   assert_file_exist "${TESTDIR}/opencode.json"
   run jq -r '.mcp["codebase-memory"].type' "${TESTDIR}/opencode.json"
   assert_success
-  assert_output "local"
+  assert_output "remote"
 
   # DDEV config is kept out of the graph
   assert_file_exist "${TESTDIR}/.cbmignore"
 
   wait_for_index
 
-  # The end-to-end contract: a JSON-RPC session over SSH from a *different*
-  # container, exactly as Claude Code / OpenCode open it. Driven from the web
-  # container because it mounts the project (and so the shared SSH key) at the
-  # same path the agent containers do.
-  run mcp_session "${INIT_REQ}"
+  # The end-to-end contract: a JSON-RPC session over HTTP from a *different*
+  # container, using the registered URL, exactly as Claude Code / OpenCode do.
+  run mcp_session
   assert_success
   assert_output --partial '"serverInfo"'
   assert_output --partial '"codebase-memory-mcp"'
 
-  # Tools are exposed over that same pipe
-  run mcp_session "${INIT_REQ}" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+  # Tools are exposed over that same session
+  run mcp_session '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
   assert_success
   assert_output --partial "search_graph"
   assert_output --partial "trace_path"
+
+  # A real tool call round-trips through the bridge and hits the graph
+  run mcp_session '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_graph","arguments":{"project":"var-www-html","label":"Function","name_pattern":".*Router.*"}}}'
+  assert_success
+  assert_output --partial "createRouter"
 
   # The graph actually contains this project's symbols, and the host command
   # quotes regex arguments so they survive the shell inside the container.
@@ -190,6 +251,54 @@ health_checks() {
   health_checks
 }
 
+@test "each MCP session gets its own server process" {
+  set -eu -o pipefail
+  # The transport's load-bearing property. A stdio pipe carries one interleaved
+  # JSON-RPC stream and per-session `initialize` state, so if the bridge shared a
+  # single child process, two agents (Claude Code + OpenCode, or two sessions of
+  # one) would corrupt each other's traffic. Assert isolation directly rather
+  # than trusting it.
+  run ddev add-on get "${DIR}"
+  assert_success
+  run ddev restart -y
+  assert_success
+  wait_for_registration
+
+  local url probe
+  url="$(jq -r '.mcpServers["codebase-memory"].url' "${TESTDIR}/.mcp.json")"
+
+  # Open three sessions and keep them open, then count server processes.
+  probe="$(mktemp)"
+  cat > "${probe}" <<'PROBE'
+set -u
+URL="$1"
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bats","version":"1"}}}'
+for n in 1 2 3; do
+  curl -sS -D "/tmp/h$n" -H 'Content-Type: application/json' -d "$INIT" "$URL" >/dev/null
+  grep -i '^Mcp-Session-Id:' "/tmp/h$n" | tr -d '\r' | awk '{print $2}'
+done
+PROBE
+  docker cp "${probe}" "ddev-${PROJNAME}-web:/tmp/open3.sh" >/dev/null
+  rm -f "${probe}"
+
+  run ddev exec bash /tmp/open3.sh "${url}"
+  assert_success
+  # Three distinct session ids
+  local ids
+  ids="$(echo "${output}" | grep -cE '^[0-9a-f]{32}$')"
+  [ "${ids}" -eq 3 ]
+  [ "$(echo "${output}" | sort -u | grep -cE '^[0-9a-f]{32}$')" -eq 3 ]
+
+  # ...backed by three distinct processes
+  run count_server_processes
+  assert_output "3"
+
+  # The bridge agrees about how many sessions it is holding
+  run ddev exec curl -sS "http://codebase-memory:9750/health"
+  assert_success
+  assert_output --partial '"sessions": 3'
+}
+
 @test "foreign MCP entries survive install and removal" {
   set -eu -o pipefail
   # Both config files are shared with other add-ons (ddev-playwright-mcp writes
@@ -205,8 +314,8 @@ health_checks() {
 
   run jq -r '.mcpServers.other.url' "${TESTDIR}/.mcp.json"
   assert_output "http://example:1/mcp"
-  run jq -r '.mcpServers["codebase-memory"].command' "${TESTDIR}/.mcp.json"
-  assert_output "ssh"
+  run jq -r '.mcpServers["codebase-memory"].type' "${TESTDIR}/.mcp.json"
+  assert_output "http"
   run jq -r '.model' "${TESTDIR}/opencode.json"
   assert_output "some/model"
 
