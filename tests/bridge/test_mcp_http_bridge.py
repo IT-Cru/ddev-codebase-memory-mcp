@@ -61,11 +61,21 @@ class Bridge:
     """A bridge subprocess wrapping the mock stdio server."""
 
     def __init__(self, **env_overrides):
-        self.port, self.ui_proxy_port = free_ports(2)
+        self.port, self.ui_proxy_port, self.ui_target_port = free_ports(3)
         env = dict(os.environ)
         env["CBM_BRIDGE_COMMAND"] = "%s %s" % (sys.executable, MOCK)
         env["CBM_BRIDGE_PORT"] = str(self.port)
         env["CBM_UI_PROXY_PORT"] = str(self.ui_proxy_port)
+        # Point the UI target at a free port rather than letting it default to
+        # 9749. On a developer machine that is where a natively installed
+        # codebase-memory-mcp serves its own UI, and the bridge under test would
+        # happily proxy to it — making results depend on what is running outside
+        # the test, and differ from CI where nothing is listening there.
+        env["CBM_UI_PORT"] = str(self.ui_target_port)
+        # Most classes have no UI behind the proxy, so the keeper would wait out its
+        # full startup window on every proxied request. Keep that short by default;
+        # the keeper's own behaviour is covered explicitly.
+        env.setdefault("CBM_UI_KEEPER_WAIT", "2")
         env.update({k: str(v) for k, v in env_overrides.items()})
         self.proc = subprocess.Popen(
             [sys.executable, BRIDGE], env=env,
@@ -99,14 +109,22 @@ class Bridge:
             req.add_header("Mcp-Session-Id", session)
         for key, value in (headers or {}).items():
             req.add_header(key, value)
+        def decode(text):
+            """Parsed JSON when it is JSON, the raw string otherwise (the UI proxy
+            returns HTML), None when empty."""
+            if not text:
+                return None
+            try:
+                return json.loads(text)
+            except ValueError:
+                return text
+
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                text = resp.read().decode()
-                return resp.status, dict(resp.headers), (json.loads(text) if text else None)
+                return resp.status, dict(resp.headers), decode(resp.read().decode())
         except urllib.error.HTTPError as exc:
             with exc:  # closing it keeps ResourceWarnings out of the test output
-                text = exc.read().decode()
-                return exc.code, dict(exc.headers), (json.loads(text) if text else None)
+                return exc.code, dict(exc.headers), decode(exc.read().decode())
 
     def open_session(self):
         """Initialize and return (session_id, result)."""
@@ -217,9 +235,14 @@ class TestProtocolBasics(BridgeTestCase):
         self.assertIsInstance(body, list)
         self.assertEqual([r["id"] for r in body], [11, 12])
 
-    def test_unknown_path_is_404(self):
-        status, _, _ = self.bridge.call("GET", path="/nope")
-        self.assertEqual(status, 404)
+    def test_non_mcp_paths_go_to_the_ui_proxy(self):
+        # Everything that is not /mcp or /health belongs to the graph UI, which is
+        # a SPA and owns its own routing. With no UI running the proxy explains
+        # itself instead of returning a bare 404.
+        status, headers, body = self.bridge.call("GET", path="/nope")
+        self.assertEqual(status, 503)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        self.assertIn("Graph UI is not running", body)
 
 
 class TestSessionIsolation(BridgeTestCase):
@@ -476,6 +499,78 @@ class TestGraphUIProxy(unittest.TestCase):
         finally:
             # Later tests in this class must not depend on ordering.
             type(self).ui = FakeUI()
+
+
+class TestUIKeeper(unittest.TestCase):
+    """The UI must be reachable with no agent attached.
+
+    CBM's UI belongs to a daemon that exits with the last MCP session, so without a
+    keeper the graph is only viewable while an agent happens to be running — which
+    is the whole obstacle to using this add-on standalone.
+    """
+
+    def test_keeper_opens_a_session_when_the_ui_is_absent(self):
+        bridge = Bridge(CBM_UI_KEEPER_WAIT="2")
+        try:
+            # Nothing is holding the daemon up yet.
+            _, _, health = bridge.call("GET", path="/health")
+            self.assertFalse(health["ui_keeper"])
+
+            # A UI request should make the bridge try to bring one up. The mock
+            # server never serves a UI, so the request still fails — but the
+            # attempt itself is the behaviour under test.
+            bridge.call("GET", path="/", timeout=30)
+
+            _, _, health = bridge.call("GET", path="/health")
+            self.assertTrue(health["ui_keeper"],
+                            "no keeper session was started for the UI request")
+        finally:
+            bridge.stop()
+
+    def test_keeper_can_be_disabled(self):
+        bridge = Bridge(CBM_UI_KEEPER="false")
+        try:
+            status, _, _ = bridge.call("GET", path="/", timeout=30)
+            self.assertEqual(status, 503)
+            _, _, health = bridge.call("GET", path="/health")
+            self.assertFalse(health["ui_keeper"])
+        finally:
+            bridge.stop()
+
+    def test_no_keeper_when_the_ui_is_already_up(self):
+        """An agent session already holds the daemon, so nothing extra is needed."""
+        ui = FakeUI()
+        bridge = Bridge(CBM_UI_PORT=ui.port)
+        try:
+            status, _, _ = bridge.call("GET", path="/")
+            self.assertEqual(status, 200)
+            _, _, health = bridge.call("GET", path="/health")
+            self.assertFalse(health["ui_keeper"],
+                             "started a keeper although the UI was already serving")
+        finally:
+            bridge.stop()
+            ui.stop()
+
+
+class TestSinglePortSurface(BridgeTestCase):
+    """MCP and the UI share one port, so the routed URL serves both."""
+
+    def test_mcp_is_served_on_the_ui_port(self):
+        url = "http://127.0.0.1:%d/mcp" % self.bridge.ui_proxy_port
+        req = urllib.request.Request(url, data=json.dumps(INIT_BODY).encode(),
+                                     method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode())
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(resp.headers.get("Mcp-Session-Id"))
+        self.assertEqual(body["result"]["serverInfo"]["name"], "mock-stdio-server")
+
+    def test_health_is_served_on_the_ui_port(self):
+        url = "http://127.0.0.1:%d/health" % self.bridge.ui_proxy_port
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(json.loads(resp.read().decode())["status"], "ok")
 
 
 class TestStartupValidation(unittest.TestCase):

@@ -27,6 +27,7 @@ import http.client
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -55,6 +56,14 @@ UI_PROXY_PORT = int(os.environ.get("CBM_UI_PROXY_PORT", "9760"))
 UI_TARGET_HOST = os.environ.get("CBM_UI_TARGET_HOST", "127.0.0.1")
 UI_TARGET_PORT = int(os.environ.get("CBM_UI_PORT", "9749"))
 UI_TIMEOUT = float(os.environ.get("CBM_UI_TIMEOUT", "60"))
+
+# The UI belongs to CBM's coordination daemon, which exits with the last MCP
+# session — so without help the graph is only viewable while an agent is attached.
+# The keeper holds one session of its own, on demand, so the add-on is useful
+# standalone. Set CBM_UI_KEEPER=false to leave the UI dependent on agent sessions.
+UI_KEEPER = os.environ.get("CBM_UI_KEEPER", "true").lower() not in ("false", "0", "no")
+UI_KEEPER_IDLE = float(os.environ.get("CBM_UI_KEEPER_IDLE", "900"))
+UI_KEEPER_WAIT = float(os.environ.get("CBM_UI_KEEPER_WAIT", "25"))
 
 JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
@@ -253,6 +262,7 @@ def _reaper():
         time.sleep(60)
         try:
             REGISTRY.reap_idle()
+            KEEPER.release_if_idle()
         except Exception as exc:  # never let the reaper die
             log("reaper error: %s" % exc)
 
@@ -295,7 +305,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/health":
-            self._send(200, {"status": "ok", "sessions": REGISTRY.count()})
+            self._send(200, {"status": "ok", "sessions": REGISTRY.count(),
+                             "ui_keeper": KEEPER.active()})
             return
         if path == MCP_PATH:
             # Legal per the spec: a server with no server-initiated messages may
@@ -407,6 +418,98 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, headers)
 
 
+class UIKeeper:
+    """Keeps the graph UI available without an agent attached.
+
+    CBM's UI is owned by the coordination daemon, which lives only as long as at
+    least one MCP session does. Opening a session here — lazily, on the first UI
+    request, and released again once nobody is looking — makes the UI usable on its
+    own while costing nothing when it is not.
+
+    The session is held outside SessionRegistry: it is not a client session, must
+    not appear in the session count, and must not be reaped on the client timeout.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._session = None
+        self._last_used = 0.0
+
+    @staticmethod
+    def ui_is_listening():
+        try:
+            with socket.create_connection((UI_TARGET_HOST, UI_TARGET_PORT), timeout=2):
+                return True
+        except OSError:
+            return False
+
+    def active(self):
+        with self._lock:
+            return self._session is not None
+
+    def ensure(self):
+        """Make the UI reachable if it can be. True when it is up."""
+        self._last_used = time.monotonic()
+        # An agent session may already be holding the daemon up, in which case
+        # there is nothing to do — the common case, and it costs one connect().
+        if self.ui_is_listening():
+            return True
+        if not UI_KEEPER:
+            return False
+
+        with self._lock:
+            if self.ui_is_listening():
+                return True
+            if self._session is not None and self._session.proc.poll() is not None:
+                self._session.close()
+                self._session = None
+            if self._session is None:
+                try:
+                    session = Session(uuid.uuid4().hex)
+                except OSError as exc:
+                    log("UI keeper: cannot start a session: %s" % exc)
+                    return False
+                try:
+                    session.send({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                   "clientInfo": {"name": "cbm-ui-keeper", "version": "1"}},
+                    })
+                except (ChildExited, ChildTimeout) as exc:
+                    log("UI keeper: initialize failed: %s" % exc)
+                    session.close()
+                    return False
+                self._session = session
+                log("UI keeper session %s started for the graph UI" % session.short_id)
+
+            deadline = time.monotonic() + UI_KEEPER_WAIT
+            while time.monotonic() < deadline:
+                if self.ui_is_listening():
+                    return True
+                if self._session.proc.poll() is not None:
+                    log("UI keeper: session exited before the UI came up")
+                    self._session.close()
+                    self._session = None
+                    return False
+                time.sleep(0.25)
+            log("UI keeper: UI did not start within %ss" % UI_KEEPER_WAIT)
+            return False
+
+    def release_if_idle(self):
+        with self._lock:
+            if self._session is None:
+                return
+            if time.monotonic() - self._last_used <= UI_KEEPER_IDLE:
+                return
+            short = self._session.short_id
+            self._session.close()
+            self._session = None
+            log("UI keeper session %s released after %ss idle" % (short, UI_KEEPER_IDLE))
+
+
+KEEPER = UIKeeper()
+
+
 UI_UNAVAILABLE_HTML = b"""<!doctype html>
 <html><head><title>Codebase Memory - graph UI not running</title>
 <style>body{font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto;
@@ -420,7 +523,7 @@ while at least one MCP session is open.</p>
 </body></html>"""
 
 
-class UIProxyHandler(BaseHTTPRequestHandler):
+class UIProxyMixin:
     """Reverse proxy for the graph UI.
 
     Two problems to solve. The UI listens on 127.0.0.1 with no way to change the
@@ -433,17 +536,11 @@ class UIProxyHandler(BaseHTTPRequestHandler):
     server-sent events, only request/response calls to /api/*.
     """
 
-    protocol_version = "HTTP/1.1"
-    server_version = "cbm-ui-proxy"
-
     # Headers that describe a single hop and must not be forwarded.
     HOP_BY_HOP = frozenset([
         "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
         "te", "trailer", "trailers", "transfer-encoding", "upgrade",
     ])
-
-    def log_message(self, fmt, *args):
-        pass
 
     def _unavailable(self):
         self.send_response(503)
@@ -454,6 +551,12 @@ class UIProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(UI_UNAVAILABLE_HTML)
 
     def _proxy(self):
+        # Bring the daemon up if nothing is holding it, so the graph is viewable
+        # without an agent session.
+        if not KEEPER.ensure():
+            self._unavailable()
+            return
+
         body = None
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -504,13 +607,41 @@ class UIProxyHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD" and payload:
             self.wfile.write(payload)
 
-    do_GET = _proxy
-    do_POST = _proxy
-    do_PUT = _proxy
-    do_PATCH = _proxy
-    do_DELETE = _proxy
-    do_HEAD = _proxy
-    do_OPTIONS = _proxy
+
+class BridgeHandler(UIProxyMixin, Handler):
+    """Serves MCP, the healthcheck and the graph UI from one port.
+
+    Both listeners use this, so the internal endpoint and the routed one behave
+    identically: /mcp and /health are handled here, anything else is proxied to the
+    UI. Keeping them on a single port halves the number of host ports the add-on
+    has to claim, and gives one URL to remember.
+    """
+
+    def _is_mcp(self):
+        return self.path.split("?", 1)[0] == MCP_PATH
+
+    def _is_health(self):
+        return self.path.split("?", 1)[0] == "/health"
+
+    def do_GET(self):
+        if self._is_mcp() or self._is_health():
+            return Handler.do_GET(self)
+        return self._proxy()
+
+    def do_POST(self):
+        if self._is_mcp():
+            return Handler.do_POST(self)
+        return self._proxy()
+
+    def do_DELETE(self):
+        if self._is_mcp():
+            return Handler.do_DELETE(self)
+        return self._proxy()
+
+    do_PUT = UIProxyMixin._proxy
+    do_PATCH = UIProxyMixin._proxy
+    do_HEAD = UIProxyMixin._proxy
+    do_OPTIONS = UIProxyMixin._proxy
 
 
 def main():
@@ -525,13 +656,14 @@ def main():
     # The UI proxy runs in the same process on its own port and in its own
     # thread. It is always listening; with no MCP session open there is no daemon
     # and therefore no UI, and it serves an explanatory 503 instead.
-    ui_server = ThreadingHTTPServer((HOST, UI_PROXY_PORT), UIProxyHandler)
+    ui_server = ThreadingHTTPServer((HOST, UI_PROXY_PORT), BridgeHandler)
     ui_server.daemon_threads = True
     threading.Thread(target=ui_server.serve_forever, daemon=True).start()
-    log("graph UI proxy on http://%s:%d -> http://%s:%d"
-        % (HOST, UI_PROXY_PORT, UI_TARGET_HOST, UI_TARGET_PORT))
+    log("graph UI + MCP on http://%s:%d (UI -> http://%s:%d)%s"
+        % (HOST, UI_PROXY_PORT, UI_TARGET_HOST, UI_TARGET_PORT,
+           "" if UI_KEEPER else " [keeper disabled]"))
 
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = ThreadingHTTPServer((HOST, PORT), BridgeHandler)
     server.daemon_threads = True
     log("listening on http://%s:%d%s -> %s%s"
         % (HOST, PORT, MCP_PATH, " ".join(CHILD_COMMAND),

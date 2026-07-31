@@ -312,25 +312,48 @@ PROBE
   local host="${PROJNAME}.ddev.site"
   local curl_opts=(--resolve "${host}:9760:127.0.0.1" -s -o)
 
-  # No MCP session yet, so no coordination daemon and no UI. The proxy should
-  # explain that rather than failing opaquely.
-  run bash -c "curl ${curl_opts[*]} '${TESTDIR}/ui-down.html' -w '%{http_code}' 'http://${host}:9760/'"
+  # No agent session anywhere: the UI must still come up, because the bridge opens
+  # a session of its own on demand. This is what makes the add-on usable standalone.
+  run bash -c "ddev exec curl -sS http://codebase-memory:9760/health"
   assert_success
-  assert_output "503"
-  run grep -q "Graph UI is not running" "${TESTDIR}/ui-down.html"
-  assert_success
+  assert_output --partial '"sessions": 0'
 
-  # Opening a session starts the daemon, and the UI with it.
-  run mcp_session
-  assert_success
-  sleep 5
-
-  run bash -c "curl ${curl_opts[*]} '${TESTDIR}/ui-up.html' -w '%{http_code}' 'http://${host}:9760/'"
+  run bash -c "curl ${curl_opts[*]} '${TESTDIR}/ui.html' -w '%{http_code}' 'http://${host}:9760/'"
   assert_success
   assert_output "200"
   # Reaching it under a *.ddev.site host at all proves the bridge rewrote Host:
   # codebase-memory-mcp answers 403 to any host but localhost.
-  run grep -q "Codebase Memory" "${TESTDIR}/ui-up.html"
+  run grep -q "Codebase Memory" "${TESTDIR}/ui.html"
+  assert_success
+
+  # ...and that it was the keeper, not an agent, holding the daemon up.
+  run bash -c "ddev exec curl -sS http://codebase-memory:9760/health"
+  assert_success
+  assert_output --partial '"ui_keeper": true'
+}
+
+@test "MCP is reachable from the host through the ddev router" {
+  set -eu -o pipefail
+  # The standalone path for non-DDEV clients: same graph, same server, reached by
+  # URL from outside the project's Docker network.
+  run ddev add-on get "${DIR}"
+  assert_success
+  run ddev restart -y
+  assert_success
+  wait_for_registration
+  wait_for_index
+
+  local host="${PROJNAME}.ddev.site"
+  local url="http://${host}:9760/mcp"
+  local init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bats-host","version":"1"}}}'
+
+  run bash -c "curl --resolve '${host}:9760:127.0.0.1' -sS -D '${TESTDIR}/mcp-h' -H 'Content-Type: application/json' -d '${init}' '${url}'"
+  assert_success
+  assert_output --partial '"serverInfo"'
+  assert_output --partial '"codebase-memory-mcp"'
+
+  # The session id header is what a host client needs for follow-up calls.
+  run grep -qi '^Mcp-Session-Id:' "${TESTDIR}/mcp-h"
   assert_success
 }
 

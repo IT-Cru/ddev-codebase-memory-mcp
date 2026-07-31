@@ -7,14 +7,22 @@
 ## Overview
 
 Runs [Codebase Memory MCP](https://github.com/DeusData/codebase-memory-mcp) — a
-knowledge graph of your codebase for AI agents (158 languages, sub-millisecond
-queries) — in its own DDEV container, and wires it into
-[Claude Code](https://github.com/trebormc/ddev-claude-code) and
-[OpenCode](https://github.com/trebormc/ddev-opencode) as an MCP server.
+knowledge graph of your codebase across 158 languages, with sub-millisecond queries
+— in its own DDEV container, indexed and kept up to date for you.
 
-Instead of reading file after file to answer "who calls this?", the agent queries
-a graph of functions, classes, call chains and HTTP routes. It also works
-standalone, without the AI add-ons.
+Instead of reading file after file to answer "who calls this?", you query a graph
+of functions, classes, call chains and HTTP routes. Three ways to use it, and they
+all work off the same index:
+
+| | |
+|---|---|
+| **Browse the graph** | A visual explorer at `http://<project>.ddev.site:9760` — no agent, no config |
+| **Give an AI agent the tools** | An MCP endpoint any client can reach by URL, registered automatically for the DDEV AI agents |
+| **Query from the shell** | `ddev cbm <tool>` runs any of the graph tools as a one-shot command |
+
+Nothing here depends on other add-ons — and it slots straight into
+[ddev-ai-workspace](https://github.com/trebormc/ddev-ai-workspace) when you use it,
+see [AI agents](#ai-agents).
 
 ## Installation
 
@@ -26,30 +34,32 @@ ddev add-on get IT-Cru/ddev-codebase-memory-mcp
 ddev restart
 ```
 
-That's it. On first start the project is indexed in the background, and the
-server is registered for both clients. Watch the initial index with:
+That's it. The project is indexed in the background on first start, and the MCP
+server is registered for the AI agent add-ons if they are present. Watch the
+initial index with:
 
 ```bash
 ddev cbm logs -f
 ```
 
-Works alongside [ddev-ai-workspace](https://github.com/trebormc/ddev-ai-workspace)
-in any install order — see [AI Workspace](#use-with-ddev-ai-workspace).
+## Browse the graph
 
-## Usage
+Open the visual explorer — no agent required, nothing to enable:
 
-Start an agent and ask it something structural — it will reach for the graph
-instead of grepping:
+```
+http://<project>.ddev.site:9760      (or https on :9761)
+```
 
 ```bash
-ddev claude-code
+ddev cbm ui
 ```
 
-```
-> which functions call OrderHandler::handle, and what would break if I change it?
-```
+prints the URL and whether it is up. See [Graph UI](#graph-ui) for the details.
 
-The same tools are available from the command line:
+## Query from the shell
+
+Every graph tool is available as a one-shot command, which makes the add-on useful
+on its own and handy for scripting:
 
 ```bash
 ddev cbm                                              # all commands
@@ -64,6 +74,56 @@ ddev cbm logs -f                                      # indexing progress
 Query tools need a `--project`; `ddev cbm` fills it in automatically when this
 project is the only one in the graph.
 
+## AI agents
+
+The server is registered automatically for
+[Claude Code](https://github.com/trebormc/ddev-claude-code) and
+[OpenCode](https://github.com/trebormc/ddev-opencode), so with either installed
+you just start an agent and ask something structural — it reaches for the graph
+instead of grepping:
+
+```bash
+ddev claude-code
+```
+
+```
+> which functions call OrderHandler::handle, and what would break if I change it?
+```
+
+Those two come as part of
+[ddev-ai-workspace](https://github.com/trebormc/ddev-ai-workspace), which bundles a
+full AI development setup for DDEV — agent CLIs, a headless browser, task tracking
+and more. This add-on is a natural companion to it: install in either order, no
+configuration, nothing owned by another add-on is modified. See
+[Use with ddev-ai-workspace](#use-with-ddev-ai-workspace).
+
+### Other MCP clients
+
+Any client that speaks MCP over HTTP can use the same endpoint. From inside the
+project's Docker network:
+
+```
+http://codebase-memory:9750/mcp
+```
+
+and from your host, through the DDEV router:
+
+```
+https://<project>.ddev.site:9761/mcp
+```
+
+Both are the same server and the same graph. A host-side client is configured with
+that URL wherever it accepts a remote or HTTP MCP server — for example a
+`{"type": "http", "url": "..."}` entry, or a UI that asks for an endpoint URL.
+Verified with a full `initialize` / `tools/list` / `tools/call` exchange from the
+host; whether a specific desktop client can reach a locally-resolved `*.ddev.site`
+address depends on that client, since some fetch remote MCP servers from their own
+cloud rather than from your machine.
+
+Set `CBM_BRIDGE_TOKEN` to require `Authorization: Bearer <token>` on `/mcp` if you
+would rather it were not open on the router. The graph UI stays reachable either
+way, since a browser cannot send that header.
+
 ## How it works
 
 `codebase-memory-mcp` speaks **stdio MCP only** — it has no HTTP transport of its
@@ -72,22 +132,25 @@ shipped with this add-on puts MCP Streamable HTTP in front of it, so agents
 register it with a plain URL instead of a command:
 
 ```
-┌──────────────────┐    POST /mcp (JSON-RPC)   ┌───────────────────────────┐
-│  claude-code     │ ────────────────────────► │  codebase-memory          │
-│  opencode        │                           │   mcp-http-bridge.py :9750│
-│  (agent CLIs)    │                           │    ├─ codebase-memory-mcp │
-└──────────────────┘                           │    ├─ codebase-memory-mcp │
-         │                                     │    └─ …one per session    │
-         │                                     │   graph cache (volume)    │
-         └── project mounted at /var/www/html ──┴───────────────────────────┘
+  agent CLIs ─────┐                    ┌───────────────────────────────┐
+  (in DDEV)       │   POST /mcp        │  codebase-memory container    │
+                  ├───────────────────►│    mcp-http-bridge.py         │
+  host MCP client │                    │      ├─ /mcp   → one          │
+  (via router) ───┤                    │      │   codebase-memory-mcp  │
+                  │                    │      │   process per session  │
+  browser ────────┘   GET /            │      └─ /      → graph UI     │
+                                       │   graph cache (volume)        │
+         project mounted at ───────────┴───────────────────────────────┘
+         /var/www/html
 ```
 
-The bridge is ~300 lines of Python **standard library only** — no pip packages, so
-nothing third-party sits between an agent and your source. It speaks the parts of
-the transport this server needs and refuses the rest explicitly: `POST /mcp` for
+The bridge is Python **standard library only** — no pip packages, so nothing
+third-party sits between an agent and your source. It speaks the parts of the
+transport this server needs and refuses the rest explicitly: `POST /mcp` for
 messages, `DELETE /mcp` to end a session, `GET /mcp` answers `405` (this server
 sends no server-initiated messages, so there is no SSE stream to open), and
-`GET /health` backs the container healthcheck.
+`GET /health` backs the container healthcheck. Everything else is proxied to the
+graph UI, so one port serves both and the add-on claims no extra host ports.
 
 **Every MCP session gets its own `codebase-memory-mcp` process**, keyed by the
 `Mcp-Session-Id` header. This is the design's load-bearing property, not an
@@ -99,9 +162,11 @@ graph cache. Idle sessions are reaped, and their child process with them.
 Both containers mount the project at the **same path** (`/var/www/html`), so the
 file paths stored in the graph resolve identically on both sides.
 
-The endpoint is published only on the project's Docker network, so there are no
-credentials to distribute. Set `CBM_BRIDGE_TOKEN` to require
-`Authorization: Bearer <token>` if you want it locked down anyway.
+Agents inside the project reach the endpoint over the Docker network, so there are
+no credentials to distribute; it is also published on the DDEV router for host-side
+clients and for the UI. Set `CBM_BRIDGE_TOKEN` to require
+`Authorization: Bearer <token>` on `/mcp` if you would rather it were not open
+there.
 
 ### What gets written to your project
 
@@ -139,7 +204,9 @@ ddev dotenv set .ddev/.env.codebase-memory --cbm-workers=4
 | `CBM_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`, `none` |
 | `CBM_VERSION` | `latest` | Pin a release, e.g. `v0.9.0` (rebuild required) |
 | `CBM_VARIANT` | `ui` | `ui` or `default` (rebuild required) |
-| `CBM_BRIDGE_TOKEN` | *(unset)* | Require `Authorization: Bearer <token>` on the endpoint |
+| `CBM_BRIDGE_TOKEN` | *(unset)* | Require `Authorization: Bearer <token>` on `/mcp` (the UI stays open) |
+| `CBM_UI_KEEPER` | `true` | Open a short-lived session so the graph UI works with no agent running |
+| `CBM_UI_KEEPER_IDLE` | `900` | Seconds of no UI traffic before that session is released |
 | `CBM_BRIDGE_IDLE_TIMEOUT` | `1800` | Seconds before an idle session and its process are reaped |
 | `CBM_BRIDGE_REQUEST_TIMEOUT` | `900` | Ceiling for a single call; a full re-index can be slow |
 
@@ -178,11 +245,12 @@ ddev cbm ui
 
 prints that URL and whether it is currently up.
 
-The UI belongs to the coordination daemon, which exists only while at least one
-MCP session is open — so it answers while `ddev claude-code` or `ddev opencode` is
-running, and serves an explanatory page the rest of the time. There is nothing to
-enable or disable: with no session there is no daemon and no UI, and with a session
-the UI is already there.
+There is nothing to enable, and no agent needs to be running. Upstream, the UI
+belongs to a coordination daemon that exists only while an MCP session does; the
+bridge opens a short-lived session of its own on the first UI request and releases
+it once nobody is looking, so browsing the graph works on a project where you never
+start an agent at all. Expect the first page load after an idle spell to take a
+moment while that comes up.
 
 The bridge reverse-proxies it, rewriting the `Host` header on the way through.
 That is what makes a `*.ddev.site` URL work at all: `codebase-memory-mcp` binds the
@@ -216,18 +284,27 @@ local development tool; if it does not suit you, drop the `HTTP_EXPOSE` /
 
 ## Use with ddev-ai-workspace
 
+[ddev-ai-workspace](https://github.com/trebormc/ddev-ai-workspace) by
+[@trebormc](https://github.com/trebormc) turns a DDEV project into a full AI
+development environment: Claude Code and OpenCode CLIs in their own containers, a
+headless Playwright browser, git-backed task tracking, shared agent configuration
+and more. If you want AI agents in DDEV, start there — this add-on then gives those
+agents a knowledge graph of the codebase to query instead of grepping their way
+through it.
+
 ```bash
 ddev add-on get trebormc/ddev-ai-workspace
 ddev add-on get IT-Cru/ddev-codebase-memory-mcp
 ddev restart
 ```
 
-Either order works. This add-on has no dependency on the workspace — it only
-registers itself in the project-root config files both clients already read, the
-same way `ddev-playwright-mcp` does, and nothing owned by another add-on changes.
+Either order works, and there is nothing to configure. This add-on declares no
+dependency on the workspace and modifies nothing the workspace owns — it registers
+itself in the two project-root config files the agent CLIs already read, the same
+way `ddev-playwright-mcp` does. Remove either add-on and the other keeps working.
 
-If you install the workspace *after* this add-on, run `ddev restart` afterwards so
-the registration is re-checked.
+If you install the workspace *after* this add-on, run `ddev restart` so the
+registration is re-checked.
 
 ## Notes
 
@@ -271,7 +348,8 @@ ddev exec curl -sS -D /tmp/h -H 'Content-Type: application/json' -d '{"jsonrpc":
 | `HTTP 401` | `CBM_BRIDGE_TOKEN` is set but the client sends no matching bearer header |
 | Agent shows no `codebase-memory` tools | Entry missing from `.mcp.json` / `opencode.json` — `ddev restart`, and check `CBM_REGISTER_MCP` |
 | Empty query results | Index not finished. `ddev cbm logs`, or `ddev cbm index` |
-| Graph UI says "not running" | No agent session open, so no daemon owns the UI — start `ddev claude-code` |
+| Graph UI says "not running" | The daemon could not be started — check `ddev cbm logs`, and that `CBM_UI_KEEPER` is not `false` |
+| Graph UI slow on first load | Expected: the daemon is starting. Subsequent loads are immediate |
 | `port is already allocated` on start | `9760`/`9761` are taken; move them with `--cbm-ui-http-expose=` |
 
 Container logs, including indexing:
