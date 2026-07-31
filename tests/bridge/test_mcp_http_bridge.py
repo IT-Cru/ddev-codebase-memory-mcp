@@ -24,6 +24,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -37,20 +38,34 @@ INIT_BODY = {
 }
 
 
+def free_ports(count=1):
+    """Distinct free ports. Bind them all before closing any, so two calls in a
+    row cannot hand back the same number."""
+    socks = []
+    try:
+        for _ in range(count):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
+
+
 def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return free_ports(1)[0]
 
 
 class Bridge:
     """A bridge subprocess wrapping the mock stdio server."""
 
     def __init__(self, **env_overrides):
-        self.port = free_port()
+        self.port, self.ui_proxy_port = free_ports(2)
         env = dict(os.environ)
         env["CBM_BRIDGE_COMMAND"] = "%s %s" % (sys.executable, MOCK)
         env["CBM_BRIDGE_PORT"] = str(self.port)
+        env["CBM_UI_PROXY_PORT"] = str(self.ui_proxy_port)
         env.update({k: str(v) for k, v in env_overrides.items()})
         self.proc = subprocess.Popen(
             [sys.executable, BRIDGE], env=env,
@@ -350,6 +365,117 @@ class TestRequestTimeout(BridgeTestCase):
         ], session=session, timeout=30)
         self.assertEqual(status, 504)
         self.assertEqual(body["id"], 42)
+
+
+class FakeUI:
+    """Stands in for the graph UI: records the Host header it was given."""
+
+    def __init__(self):
+        self.port = free_port()
+        self.seen_hosts = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def _respond(self):
+                outer.seen_hosts.append(self.headers.get("Host"))
+                # Mimic the real UI: reject any Host that is not loopback.
+                host = (self.headers.get("Host") or "").split(":")[0]
+                if host not in ("127.0.0.1", "localhost"):
+                    body = b"forbidden"
+                    self.send_response(403)
+                else:
+                    length = int(self.headers.get("Content-Length", "0") or 0)
+                    sent = self.rfile.read(length) if length else b""
+                    body = json.dumps({
+                        "path": self.path, "method": self.command,
+                        "body": sent.decode() or None,
+                    }).encode()
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Upstream", "fake-ui")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            do_GET = _respond
+            do_POST = _respond
+            do_HEAD = _respond
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), H)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestGraphUIProxy(unittest.TestCase):
+    """The UI listens on loopback only and rejects non-localhost Host headers, so
+    the bridge has to proxy it *and* rewrite Host for a *.ddev.site URL to work."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ui = FakeUI()
+        cls.bridge = Bridge(CBM_UI_PORT=cls.ui.port)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.bridge.stop()
+        cls.ui.stop()
+
+    def _get(self, path="/", method="GET", body=None, host_header=None):
+        url = "http://127.0.0.1:%d%s" % (self.bridge.ui_proxy_port, path)
+        data = body.encode() if body else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if host_header:
+            req.add_header("Host", host_header)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, dict(exc.headers), exc.read().decode()
+
+    def test_proxies_and_rewrites_host_to_loopback(self):
+        status, headers, body = self._get("/", host_header="uitest.ddev.site:9761")
+        self.assertEqual(status, 200, body)
+        # The upstream saw loopback, not the ddev.site name it would have refused.
+        self.assertTrue(self.ui.seen_hosts)
+        self.assertTrue(self.ui.seen_hosts[-1].startswith("127.0.0.1"),
+                        "upstream saw Host=%r" % self.ui.seen_hosts[-1])
+        self.assertEqual(headers.get("X-Upstream"), "fake-ui")
+
+    def test_preserves_path_and_query(self):
+        status, _, body = self._get("/api/processes?a=1&b=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["path"], "/api/processes?a=1&b=2")
+
+    def test_forwards_post_body(self):
+        status, _, body = self._get("/api/index", method="POST", body='{"x":1}')
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["method"], "POST")
+        self.assertEqual(payload["body"], '{"x":1}')
+
+    def test_serves_explanatory_503_when_ui_is_down(self):
+        """With no MCP session there is no daemon and no UI; say so in the page."""
+        self.ui.stop()
+        try:
+            status, headers, body = self._get("/")
+            self.assertEqual(status, 503)
+            self.assertIn("text/html", headers.get("Content-Type", ""))
+            self.assertIn("not running", body)
+            self.assertIn("ddev claude-code", body)
+        finally:
+            # Later tests in this class must not depend on ordering.
+            type(self).ui = FakeUI()
 
 
 class TestStartupValidation(unittest.TestCase):

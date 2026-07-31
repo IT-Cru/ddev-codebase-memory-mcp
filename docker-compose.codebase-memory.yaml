@@ -38,11 +38,13 @@ services:
       - IS_DDEV_PROJECT=true
       - TZ=${TZ:-UTC}
       - VIRTUAL_HOST=${DDEV_HOSTNAME}
-      # No HTTP_EXPOSE/HTTPS_EXPOSE for the graph UI: it enforces a
-      # localhost-only Host allowlist, so requests arriving through the DDEV
-      # router as https://<project>.ddev.site get a 403. `ddev cbm ui on`
-      # instead writes a docker-compose.codebase-memory-ui.yaml that publishes
-      # the port on host loopback, where the Host header is accepted.
+      # Graph UI, served through ddev-router at https://<project>.ddev.site:9761.
+      # The bridge reverse-proxies it and rewrites the Host header, which is what
+      # makes a *.ddev.site URL work at all — the UI itself answers 403 to any
+      # host but localhost. Override both if 9760/9761 are taken on your machine:
+      #   ddev dotenv set .ddev/.env.codebase-memory --cbm-ui-http-expose=9860:9760
+      - HTTP_EXPOSE=${CBM_UI_HTTP_EXPOSE:-9760:9760}
+      - HTTPS_EXPOSE=${CBM_UI_HTTPS_EXPOSE:-9761:9760}
 
       # --- codebase-memory-mcp configuration ---
       # One canonical cache root per container: every MCP session, CLI command
@@ -51,11 +53,11 @@ services:
       # Refuse to index anything outside the project. The server is driven by an
       # AI agent, so the blast radius of a bad repo_path is worth bounding.
       - CBM_ALLOWED_ROOT=/var/www/html
-      - CBM_UI=${CBM_UI:-false}
-      # CBM's own UI port (127.0.0.1-only), and the routable port the entrypoint
-      # bridges it onto for the DDEV router.
+      # CBM's own UI port (127.0.0.1-only inside the container) and the routable
+      # port the bridge proxies it onto. The UI runs whenever an MCP session is
+      # open, so there is nothing to switch on.
       - CBM_UI_PORT=9749
-      - CBM_UI_BRIDGE_PORT=9748
+      - CBM_UI_PROXY_PORT=9760
       - CBM_AUTO_INDEX=${CBM_AUTO_INDEX:-true}
       - CBM_REGISTER_MCP=${CBM_REGISTER_MCP:-true}
       # --- HTTP bridge ---
@@ -82,6 +84,7 @@ services:
 
     expose:
       - "9750"
+      - "9760"
 
     healthcheck:
       # Both halves of the contract: the binary runs, and the bridge serves HTTP.
@@ -101,7 +104,7 @@ services:
         Endpoint: http://codebase-memory:9750/mcp (project network)
         Registered in: .mcp.json (Claude Code), opencode.json (OpenCode)
         CLI: ddev cbm <tool>   |   Re-index: ddev cbm index
-        Graph UI: ddev cbm ui on
+        Graph UI: https://${DDEV_HOSTNAME}:9761 (while an agent session is open)
 
 networks:
   ddev_default:

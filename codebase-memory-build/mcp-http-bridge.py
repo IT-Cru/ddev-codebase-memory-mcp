@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ddev-generated
+#ddev-generated
 """Streamable HTTP transport in front of a stdio MCP server.
 
 codebase-memory-mcp speaks stdio only, so it cannot be registered with a URL.
@@ -16,10 +16,14 @@ and refuses the rest explicitly rather than half-supporting it.
   GET    /mcp      405 — no server-initiated messages, so no SSE stream
   GET    /health   liveness for the container healthcheck
 
+A second server on CBM_UI_PROXY_PORT reverse-proxies the graph UI, which
+codebase-memory-mcp binds to 127.0.0.1 only — see UIProxyHandler.
+
 Only the Python standard library is used; there is no third-party code in the
 path between an agent and your source.
 """
 
+import http.client
 import json
 import os
 import queue
@@ -43,6 +47,14 @@ TOKEN = os.environ.get("CBM_BRIDGE_TOKEN", "")
 IDLE_TIMEOUT = float(os.environ.get("CBM_BRIDGE_IDLE_TIMEOUT", "1800"))
 REQUEST_TIMEOUT = float(os.environ.get("CBM_BRIDGE_REQUEST_TIMEOUT", "900"))
 MAX_BODY_BYTES = int(os.environ.get("CBM_BRIDGE_MAX_BODY", str(16 * 1024 * 1024)))
+
+# Graph UI reverse proxy. codebase-memory-mcp serves the UI on loopback inside
+# this container and offers no bind-address option, so it is unreachable both
+# from a published port and from ddev-router without a proxy in front.
+UI_PROXY_PORT = int(os.environ.get("CBM_UI_PROXY_PORT", "9760"))
+UI_TARGET_HOST = os.environ.get("CBM_UI_TARGET_HOST", "127.0.0.1")
+UI_TARGET_PORT = int(os.environ.get("CBM_UI_PORT", "9749"))
+UI_TIMEOUT = float(os.environ.get("CBM_UI_TIMEOUT", "60"))
 
 JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
@@ -395,6 +407,112 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, headers)
 
 
+UI_UNAVAILABLE_HTML = b"""<!doctype html>
+<html><head><title>Codebase Memory - graph UI not running</title>
+<style>body{font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto;
+padding:0 1rem;line-height:1.5}code{background:#8881;padding:.1rem .3rem;
+border-radius:.2rem}</style></head><body>
+<h1>Graph UI is not running</h1>
+<p>The UI belongs to the codebase-memory coordination daemon, which exists only
+while at least one MCP session is open.</p>
+<p>Start an agent, then reload this page:</p>
+<pre><code>ddev claude-code</code>   or   <code>ddev opencode</code></pre>
+</body></html>"""
+
+
+class UIProxyHandler(BaseHTTPRequestHandler):
+    """Reverse proxy for the graph UI.
+
+    Two problems to solve. The UI listens on 127.0.0.1 with no way to change the
+    bind address, so nothing outside the container can reach it. And it enforces a
+    localhost-only Host allowlist (DNS-rebinding protection), so a request
+    arriving through ddev-router as <project>.ddev.site is answered with 403 —
+    hence the Host rewrite below.
+
+    Plain HTTP is enough: the UI bundle uses no WebSocket, EventSource or
+    server-sent events, only request/response calls to /api/*.
+    """
+
+    protocol_version = "HTTP/1.1"
+    server_version = "cbm-ui-proxy"
+
+    # Headers that describe a single hop and must not be forwarded.
+    HOP_BY_HOP = frozenset([
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailer", "trailers", "transfer-encoding", "upgrade",
+    ])
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _unavailable(self):
+        self.send_response(503)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(UI_UNAVAILABLE_HTML)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(UI_UNAVAILABLE_HTML)
+
+    def _proxy(self):
+        body = None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length > 0:
+            if length > MAX_BODY_BYTES:
+                self.send_response(413)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = self.rfile.read(length)
+
+        headers = {}
+        for key, value in self.headers.items():
+            if key.lower() not in self.HOP_BY_HOP:
+                headers[key] = value
+        headers["Host"] = "%s:%d" % (UI_TARGET_HOST, UI_TARGET_PORT)
+        # Accept-Encoding is dropped so the upstream reply is not compressed:
+        # this proxy buffers the body and rewrites Content-Length, and passing a
+        # gzip body through with a recomputed length would corrupt it.
+        headers.pop("Accept-Encoding", None)
+
+        conn = http.client.HTTPConnection(UI_TARGET_HOST, UI_TARGET_PORT,
+                                          timeout=UI_TIMEOUT)
+        try:
+            conn.request(self.command, self.path, body=body, headers=headers)
+            upstream = conn.getresponse()
+            payload = upstream.read()
+            status = upstream.status
+            upstream_headers = upstream.getheaders()
+        except (OSError, http.client.HTTPException):
+            # Connection refused is the normal case: no session, so no daemon,
+            # so no UI. Anything else here is equally unserveable.
+            self._unavailable()
+            return
+        finally:
+            conn.close()
+
+        self.send_response(status)
+        for key, value in upstream_headers:
+            lowered = key.lower()
+            if lowered in self.HOP_BY_HOP or lowered == "content-length":
+                continue
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if self.command != "HEAD" and payload:
+            self.wfile.write(payload)
+
+    do_GET = _proxy
+    do_POST = _proxy
+    do_PUT = _proxy
+    do_PATCH = _proxy
+    do_DELETE = _proxy
+    do_HEAD = _proxy
+    do_OPTIONS = _proxy
+
+
 def main():
     # Fail at startup rather than turning every session into a 500: an empty or
     # whitespace-only CBM_BRIDGE_COMMAND splits to [], which Popen rejects.
@@ -403,6 +521,16 @@ def main():
         return 2
 
     threading.Thread(target=_reaper, daemon=True).start()
+
+    # The UI proxy runs in the same process on its own port and in its own
+    # thread. It is always listening; with no MCP session open there is no daemon
+    # and therefore no UI, and it serves an explanatory 503 instead.
+    ui_server = ThreadingHTTPServer((HOST, UI_PROXY_PORT), UIProxyHandler)
+    ui_server.daemon_threads = True
+    threading.Thread(target=ui_server.serve_forever, daemon=True).start()
+    log("graph UI proxy on http://%s:%d -> http://%s:%d"
+        % (HOST, UI_PROXY_PORT, UI_TARGET_HOST, UI_TARGET_PORT))
+
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
     log("listening on http://%s:%d%s -> %s%s"

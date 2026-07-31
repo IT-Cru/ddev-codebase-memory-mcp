@@ -9,6 +9,24 @@ dependencies: []
 
 pre_install_actions:
   - |
+    #ddev-description:Clearing a stale graph bridge from an earlier version
+    # Earlier versions of this file carried "# ddev-generated" — with a space.
+    # DDEV matches the exact literal "#ddev-generated" to decide a file is safe to
+    # replace, so on upgrade it keeps that old bridge while updating everything
+    # around it: the compose file then publishes a UI proxy port the bridge does
+    # not serve. Deleting it here (pre_install runs before files are copied) lets
+    # the current version land.
+    #
+    # The test is for the old marker specifically, not merely a missing one —
+    # stripping the marker is how DDEV users opt a file out of being overwritten,
+    # and that choice must be respected.
+    BRIDGE="${DDEV_APPROOT}/.ddev/codebase-memory-build/mcp-http-bridge.py"
+    if [ -f "$BRIDGE" ] && grep -q '^# ddev-generated$' "$BRIDGE"; then
+      rm -f "$BRIDGE"
+      echo "Removed stale mcp-http-bridge.py from an earlier version"
+    fi
+
+  - |
     #ddev-description:Checking platform support
     # Upstream publishes linux binaries for amd64 and arm64 only.
     arch="$(uname -m)"
@@ -31,6 +49,25 @@ project_files:
 global_files: []
 
 post_install_actions:
+  - |
+    #ddev-description:Removing superseded graph UI port mapping
+    # Earlier versions published the UI through a generated compose file written
+    # by `ddev cbm ui on`. The UI is now proxied by the bridge and routed through
+    # ddev-router, so that file would publish a port nothing serves — and could
+    # block `ddev start` by colliding on the host.
+    UI_COMPOSE="${DDEV_APPROOT}/.ddev/docker-compose.codebase-memory-ui.yaml"
+    if [ -f "$UI_COMPOSE" ] && grep -q '#ddev-generated' "$UI_COMPOSE"; then
+      rm -f "$UI_COMPOSE"
+      echo "Removed superseded graph UI port mapping"
+    fi
+    # CBM_UI was an exposure switch, never a UI on/off switch, and no longer does
+    # anything. Drop it so it cannot confuse anyone reading the file.
+    ENV_FILE="${DDEV_APPROOT}/.ddev/.env.codebase-memory"
+    if [ -f "$ENV_FILE" ] && grep -q '^CBM_UI=' "$ENV_FILE"; then
+      sed -i.bak '/^CBM_UI=/d' "$ENV_FILE" && rm -f "${ENV_FILE}.bak"
+      echo "Removed obsolete CBM_UI from .ddev/.env.codebase-memory"
+    fi
+
   - |
     #ddev-description:Seeding .cbmignore
     # Without this, DDEV's own config is indexed as if it were application code:
@@ -65,10 +102,13 @@ post_install_actions:
     echo "  .mcp.json      -> Claude Code   (ddev claude-code)"
     echo "  opencode.json  -> OpenCode      (ddev opencode)"
     echo ""
+    echo "The graph UI is served while an agent session is open:"
+    echo "  https://${DDEV_SITENAME}.ddev.site:9761"
+    echo ""
     echo "Handy commands:"
     echo "  ddev cbm index                 # re-index the project"
     echo "  ddev cbm list_projects         # what is in the graph"
-    echo "  ddev cbm ui on                 # enable the graph UI, then restart"
+    echo "  ddev cbm ui                    # graph UI URL and status"
     echo "  ddev cbm --help                # all tools"
     echo ""
 

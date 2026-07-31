@@ -299,6 +299,41 @@ PROBE
   assert_output --partial '"sessions": 3'
 }
 
+@test "graph UI is served through the ddev router" {
+  set -eu -o pipefail
+  run ddev add-on get "${DIR}"
+  assert_success
+  run ddev restart -y
+  assert_success
+  wait_for_registration
+
+  # --resolve keeps this independent of *.ddev.site DNS while still sending the
+  # project Host header, which is what the router matches on.
+  local host="${PROJNAME}.ddev.site"
+  local curl_opts=(--resolve "${host}:9760:127.0.0.1" -s -o)
+
+  # No MCP session yet, so no coordination daemon and no UI. The proxy should
+  # explain that rather than failing opaquely.
+  run bash -c "curl ${curl_opts[*]} '${TESTDIR}/ui-down.html' -w '%{http_code}' 'http://${host}:9760/'"
+  assert_success
+  assert_output "503"
+  run grep -q "Graph UI is not running" "${TESTDIR}/ui-down.html"
+  assert_success
+
+  # Opening a session starts the daemon, and the UI with it.
+  run mcp_session
+  assert_success
+  sleep 5
+
+  run bash -c "curl ${curl_opts[*]} '${TESTDIR}/ui-up.html' -w '%{http_code}' 'http://${host}:9760/'"
+  assert_success
+  assert_output "200"
+  # Reaching it under a *.ddev.site host at all proves the bridge rewrote Host:
+  # codebase-memory-mcp answers 403 to any host but localhost.
+  run grep -q "Codebase Memory" "${TESTDIR}/ui-up.html"
+  assert_success
+}
+
 @test "foreign MCP entries survive install and removal" {
   set -eu -o pipefail
   # Both config files are shared with other add-ons (ddev-playwright-mcp writes
