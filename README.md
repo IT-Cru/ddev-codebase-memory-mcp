@@ -132,16 +132,18 @@ shipped with this add-on puts MCP Streamable HTTP in front of it, so agents
 register it with a plain URL instead of a command:
 
 ```
-  agent CLIs ─────┐                    ┌───────────────────────────────┐
-  (in DDEV)       │   POST /mcp        │  codebase-memory container    │
-                  ├───────────────────►│    mcp-http-bridge.py         │
-  host MCP client │                    │      ├─ /mcp   → one          │
-  (via router) ───┤                    │      │   codebase-memory-mcp  │
-                  │                    │      │   process per session  │
-  browser ────────┘   GET /            │      └─ /      → graph UI     │
-                                       │   graph cache (volume)        │
-         project mounted at ───────────┴───────────────────────────────┘
-         /var/www/html
+┌───────────────────────┐              ┌──────────────────────────────────────┐
+│ agent CLIs (in DDEV)  │              │ codebase-memory container            │
+│ host MCP client       │              │                                      │
+│ browser               │ ── HTTP ───► │ mcp-http-bridge.py                   │
+└───────────────────────┘              │   ├─ /mcp  → one codebase-memory-mcp │
+                                       │   │           process per session    │
+                                       │   └─ /      → graph UI (proxied)     │
+                                       │                                      │
+                                       │ graph cache (named volume)           │
+                                       └──────────────────────────────────────┘
+
+both mount the project at /var/www/html, so graph paths resolve on either side
 ```
 
 The bridge is Python **standard library only** — no pip packages, so nothing
