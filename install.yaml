@@ -9,6 +9,24 @@ dependencies: []
 
 pre_install_actions:
   - |
+    #ddev-description:Clearing a stale graph bridge from an earlier version
+    # Earlier versions of this file carried "# ddev-generated" — with a space.
+    # DDEV matches the exact literal "#ddev-generated" to decide a file is safe to
+    # replace, so on upgrade it keeps that old bridge while updating everything
+    # around it: the compose file then publishes a UI proxy port the bridge does
+    # not serve. Deleting it here (pre_install runs before files are copied) lets
+    # the current version land.
+    #
+    # The test is for the old marker specifically, not merely a missing one —
+    # stripping the marker is how DDEV users opt a file out of being overwritten,
+    # and that choice must be respected.
+    BRIDGE="${DDEV_APPROOT}/.ddev/codebase-memory-build/mcp-http-bridge.py"
+    if [ -f "$BRIDGE" ] && grep -q '^# ddev-generated$' "$BRIDGE"; then
+      rm -f "$BRIDGE"
+      echo "Removed stale mcp-http-bridge.py from an earlier version"
+    fi
+
+  - |
     #ddev-description:Checking platform support
     # Upstream publishes linux binaries for amd64 and arm64 only.
     arch="$(uname -m)"
