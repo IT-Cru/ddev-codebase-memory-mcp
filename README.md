@@ -1,6 +1,7 @@
 # DDEV Codebase Memory MCP
 
-[![tests](https://github.com/IT-Cru/ddev-codebase-memory-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/IT-Cru/ddev-codebase-memory-mcp/actions/workflows/tests.yml)
+[![add-on registry](https://img.shields.io/badge/DDEV-Add--on_Registry-blue)](https://addons.ddev.com)
+[![tests](https://github.com/IT-Cru/ddev-codebase-memory-mcp/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/IT-Cru/ddev-codebase-memory-mcp/actions/workflows/tests.yml?query=branch%3Amain)
 [![last commit](https://img.shields.io/github/last-commit/IT-Cru/ddev-codebase-memory-mcp)](https://github.com/IT-Cru/ddev-codebase-memory-mcp/commits)
 [![release](https://img.shields.io/github/v/release/IT-Cru/ddev-codebase-memory-mcp)](https://github.com/IT-Cru/ddev-codebase-memory-mcp/releases/latest)
 
@@ -28,9 +29,6 @@ see [AI agents](#ai-agents).
 
 ```bash
 ddev add-on get IT-Cru/ddev-codebase-memory-mcp
-```
-
-```bash
 ddev restart
 ```
 
