@@ -124,11 +124,9 @@ prints only the JSON result, so it pipes:
 This matters more than it looks. Calling an MCP tool puts its entire response into
 the agent's context, and graph results carry per-node fields nobody reads —
 fingerprints, metric vectors, a dozen complexity counters. On a three-function
-project that one pipeline is **2123 bytes of tool result reduced to 182** (~91%),
-and the ratio comes from per-node fields, so it grows with the result set. Filtering
-in a shell keeps the answer and drops the rest, which is the
-[code-mode](https://blog.cloudflare.com/code-mode/) argument applied with a shell
-the agent already has instead of a sandbox we would have to build.
+project that one pipeline is **2123 bytes of tool result reduced to 182** (~91%), and
+the ratio comes from per-node fields, so it grows with the result set. Filtering in a
+shell keeps the answer and drops the rest.
 
 It reuses one MCP session across calls, so a pipeline of several queries does not
 start a server process per invocation, and re-initializes by itself if the container
