@@ -95,6 +95,51 @@ and more. This add-on is a natural companion to it: install in either order, no
 configuration, nothing owned by another add-on is modified. See
 [Use with ddev-ai-workspace](#use-with-ddev-ai-workspace).
 
+### Getting more out of an agent
+
+Two things ship with the add-on to make agents use the graph well rather than
+falling back to grep.
+
+**Instructions.** `.ddev/codebase-memory/AGENT-INSTRUCTIONS.md` tells an agent which
+tool answers which question, to call `get_graph_schema` first, and to prefer one
+`query_graph` call over a chain of narrower ones. Reference it from your own
+instruction file rather than having it installed over the top — for Claude Code, add
+to `CLAUDE.md`:
+
+```
+@.ddev/codebase-memory/AGENT-INSTRUCTIONS.md
+```
+
+For OpenCode, add the path to the `instructions` array in your `opencode.json`.
+
+**A shell shim.** `.ddev/codebase-memory/cbm` runs any graph tool from inside a
+container — agent containers mount the project but have no `ddev` binary — and
+prints only the JSON result, so it pipes:
+
+```bash
+.ddev/codebase-memory/cbm search_graph --label Function \
+  | jq '[.results[] | {name, file_path, out_degree}] | sort_by(-.out_degree) | .[:5]'
+```
+
+This matters more than it looks. Calling an MCP tool puts its entire response into
+the agent's context, and graph results carry per-node fields nobody reads —
+fingerprints, metric vectors, a dozen complexity counters. On a three-function
+project that one pipeline is **2123 bytes of tool result reduced to 182** (~91%),
+and the ratio comes from per-node fields, so it grows with the result set. Filtering
+in a shell keeps the answer and drops the rest, which is the
+[code-mode](https://blog.cloudflare.com/code-mode/) argument applied with a shell
+the agent already has instead of a sandbox we would have to build.
+
+It reuses one MCP session across calls, so a pipeline of several queries does not
+start a server process per invocation, and re-initializes by itself if the container
+restarted. `cbm --help` has more examples.
+
+`--project` is filled in with `var-www-html`, which is what CBM derives from the
+container mount path — so it holds whatever your DDEV project is called. It would
+only be wrong if you indexed under a custom `--name` or from a subdirectory, and in
+that case the server answers with the names it does have; `CBM_PROJECT` overrides the
+default.
+
 ### Other MCP clients
 
 Any client that speaks MCP over HTTP can use the same endpoint. From inside the

@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+#ddev-generated
+#
+# cbm — query the codebase knowledge graph from inside a container.
+#
+# Meant for AI agent containers (ddev-claude-code, ddev-opencode) and the web
+# container: anything on the project's Docker network. Prints the tool's JSON
+# result on stdout and nothing else, so it composes with jq.
+#
+#   cbm get_graph_schema
+#   cbm search_graph --label Function --name-pattern '.*Handler.*'
+#   cbm trace_path --function-name handle --direction both
+#   cbm query_graph --query 'MATCH (f:Function) RETURN f.name LIMIT 5'
+#
+# Why this exists: calling the MCP tools directly puts every byte of a result
+# into the agent's context, and graph results carry per-node fields no one reads
+# (fingerprints, metric vectors). Piping through jq keeps the answer and drops
+# the rest:
+#
+#   cbm search_graph --label Function \
+#     | jq '[.results[] | {name, file_path, out_degree}] | sort_by(-.out_degree) | .[:5]'
+#
+# Requires: curl, jq. No ddev binary and no MCP client needed.
+
+set -uo pipefail
+
+ENDPOINT="${CBM_MCP_URL:-http://codebase-memory:9750/mcp}"
+# One session per shell rather than per call: a session owns a server process, so
+# reusing it across a pipeline avoids starting and stopping one every time.
+SESSION_CACHE="${TMPDIR:-/tmp}/.cbm-shim-session"
+# The graph project name is derived from the repository path, which inside these
+# containers is always the same mount point.
+DEFAULT_PROJECT="${CBM_PROJECT:-var-www-html}"
+
+die() { echo "cbm: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+cbm — query the codebase knowledge graph
+
+  cbm <tool> [--flag value ...]        run a graph tool, print its JSON result
+  cbm --tools                          list the available tools
+  cbm --help                           this text
+
+Flags map to tool arguments: --name-pattern becomes name_pattern. --project is
+filled in automatically for tools that need it.
+
+Examples
+  cbm get_graph_schema
+  cbm get_architecture | jq '.languages'
+  cbm search_graph --label Class | jq -r '.results[].qualified_name'
+  cbm search_graph --label Function --name-pattern '.*Handler.*' \
+    | jq '[.results[] | {name, file_path, in_degree}]'
+  cbm trace_path --function-name handle --direction both \
+    | jq '{callers: [.callers[].name], callees: [.callees[].name]}'
+  cbm query_graph --query 'MATCH (f:Function) WHERE f.out_degree > 3 RETURN f.name, f.out_degree'
+  cbm get_code_snippet --qualified-name var-www-html.src.app.createRouter | jq -r '.source'
+
+Prefer query_graph with an explicit RETURN for anything multi-hop: one call, and
+only the fields you asked for.
+EOF
+}
+
+command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v jq   >/dev/null 2>&1 || die "jq is required"
+
+# --- session handling -------------------------------------------------------
+mcp_initialize() {
+  local body headers sid
+  headers="$(mktemp)"
+  body='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cbm-shim","version":"1"}}}'
+  curl -sS -D "$headers" -o /dev/null -H 'Content-Type: application/json' \
+       ${CBM_MCP_TOKEN:+-H "Authorization: Bearer ${CBM_MCP_TOKEN}"} \
+       -d "$body" "$ENDPOINT" || { rm -f "$headers"; die "cannot reach ${ENDPOINT}"; }
+  sid="$(grep -i '^Mcp-Session-Id:' "$headers" | tr -d '\r' | awk '{print $2}')"
+  rm -f "$headers"
+  [ -n "$sid" ] || die "server did not return a session id"
+  printf '%s' "$sid" > "$SESSION_CACHE"
+  printf '%s' "$sid"
+}
+
+session_id() {
+  if [ -s "$SESSION_CACHE" ]; then
+    cat "$SESSION_CACHE"
+  else
+    mcp_initialize
+  fi
+}
+
+# rpc <session> <json-body> -> raw response on stdout, HTTP status on fd 3
+rpc() {
+  curl -sS -w '\n%{http_code}' -H 'Content-Type: application/json' \
+       -H "Mcp-Session-Id: $1" \
+       ${CBM_MCP_TOKEN:+-H "Authorization: Bearer ${CBM_MCP_TOKEN}"} \
+       -d "$2" "$ENDPOINT"
+}
+
+# Send a request, transparently re-initializing if the cached session is gone
+# (the container restarted, or the session was reaped for being idle).
+call_with_session() {
+  local body="$1" out status sid
+  sid="$(session_id)"
+  out="$(rpc "$sid" "$body")" || die "request failed"
+  status="${out##*$'\n'}"
+  if [ "$status" = "404" ]; then
+    rm -f "$SESSION_CACHE"
+    sid="$(mcp_initialize)"
+    out="$(rpc "$sid" "$body")" || die "request failed"
+    status="${out##*$'\n'}"
+  fi
+  [ "$status" = "200" ] || die "server returned HTTP ${status}: ${out%$'\n'*}"
+  printf '%s' "${out%$'\n'*}"
+}
+
+# --- argument mapping -------------------------------------------------------
+# Tools that operate on an already-indexed project take --project; fill it in so
+# callers do not have to know the derived name.
+needs_project() {
+  # index_repository is addressed by --repo-path; every other tool here, including
+  # get_graph_schema, requires --project.
+  case "$1" in
+    index_repository) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Build the MCP arguments object from --flag value pairs.
+build_arguments() {
+  local args="{}" key value
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --*)
+        key="${1#--}"
+        key="${key//-/_}"
+        if [ "$#" -lt 2 ] || [ "${2:0:2}" = "--" ]; then
+          # Bare flag: treat as boolean true.
+          args="$(jq -c --arg k "$key" '. + {($k): true}' <<<"$args")"
+          shift
+        else
+          value="$2"
+          if [[ "$value" =~ ^-?[0-9]+$ ]]; then
+            args="$(jq -c --arg k "$key" --argjson v "$value" '. + {($k): $v}' <<<"$args")"
+          elif [ "$value" = "true" ] || [ "$value" = "false" ]; then
+            args="$(jq -c --arg k "$key" --argjson v "$value" '. + {($k): $v}' <<<"$args")"
+          else
+            args="$(jq -c --arg k "$key" --arg v "$value" '. + {($k): $v}' <<<"$args")"
+          fi
+          shift 2
+        fi
+        ;;
+      *)
+        die "unexpected argument '$1' (flags must look like --name value)"
+        ;;
+    esac
+  done
+  printf '%s' "$args"
+}
+
+# --- main -------------------------------------------------------------------
+case "${1:-}" in
+  ""|-h|--help|help) usage; exit 0 ;;
+  --tools)
+    call_with_session '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+      | jq -r '.result.tools[] | "  \(.name)"'
+    exit 0
+    ;;
+esac
+
+TOOL="$1"; shift
+ARGUMENTS="$(build_arguments "$@")" || exit 1
+
+if needs_project "$TOOL" && ! jq -e 'has("project")' >/dev/null 2>&1 <<<"$ARGUMENTS"; then
+  ARGUMENTS="$(jq -c --arg p "$DEFAULT_PROJECT" '. + {project: $p}' <<<"$ARGUMENTS")"
+fi
+
+REQUEST="$(jq -cn --arg name "$TOOL" --argjson args "$ARGUMENTS" \
+  '{jsonrpc: "2.0", id: 3, method: "tools/call", params: {name: $name, arguments: $args}}')"
+
+RESPONSE="$(call_with_session "$REQUEST")" || exit 1
+
+# A tool error is reported in-band; surface it as a non-zero exit.
+if jq -e '.result.isError == true' >/dev/null 2>&1 <<<"$RESPONSE"; then
+  jq -r '.result.content[0].text // "unknown tool error"' <<<"$RESPONSE" >&2
+  exit 1
+fi
+if jq -e 'has("error")' >/dev/null 2>&1 <<<"$RESPONSE"; then
+  jq -r '.error.message // "unknown error"' <<<"$RESPONSE" >&2
+  exit 1
+fi
+
+# Tool results arrive as text content holding JSON. Emit that JSON so the output
+# pipes into jq; fall back to the raw text if it is not JSON.
+TEXT="$(jq -r '.result.content[0].text // empty' <<<"$RESPONSE")"
+if [ -n "$TEXT" ]; then
+  if jq -e . >/dev/null 2>&1 <<<"$TEXT"; then
+    jq . <<<"$TEXT"
+  else
+    printf '%s\n' "$TEXT"
+  fi
+else
+  jq '.result' <<<"$RESPONSE"
+fi

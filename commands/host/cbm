@@ -61,8 +61,10 @@ resolve_project() {
 }
 
 needs_project() {
+  # index_repository is addressed by --repo-path and list_projects spans all
+  # projects; everything else, get_graph_schema included, requires --project.
   case "$1" in
-    index_repository|list_projects|get_graph_schema) return 1 ;;
+    index_repository|list_projects) return 1 ;;
     *) return 0 ;;
   esac
 }

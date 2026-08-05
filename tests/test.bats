@@ -234,6 +234,12 @@ health_checks() {
   assert_success
   assert_output --partial "createRouter"
 
+  # --project is auto-filled for get_graph_schema too, which the README tells
+  # people to run first.
+  run ddev cbm get_graph_schema
+  assert_success
+  assert_output --partial "node_labels"
+
   # Exactly one project: a second, redundant graph appears if the pre-index and
   # a session's auto-index disagree about the project name.
   run bash -c "ddev cbm list_projects 2>/dev/null | tail -1 | jq '.projects | length'"
@@ -355,6 +361,52 @@ PROBE
   # The session id header is what a host client needs for follow-up calls.
   run grep -qi '^Mcp-Session-Id:' "${TESTDIR}/mcp-h"
   assert_success
+}
+
+@test "the cbm shim queries the graph from inside a container" {
+  set -eu -o pipefail
+  # Agent containers mount the project but have no ddev binary and no MCP client,
+  # so the shim is how an agent can pipe graph results through jq instead of
+  # pulling whole tool responses into its context. Driven from the web container,
+  # which sits in the same place on the project network.
+  run ddev add-on get "${DIR}"
+  assert_success
+  run ddev restart -y
+  assert_success
+  wait_for_index
+
+  local shim=/var/www/html/.ddev/codebase-memory/cbm
+
+  run ddev exec "${shim}" --tools
+  assert_success
+  assert_output --partial "search_graph"
+  assert_output --partial "query_graph"
+
+  # --project is filled in automatically, and --name-pattern maps to name_pattern.
+  run ddev exec "${shim}" search_graph --label Function --name-pattern '.*Router.*'
+  assert_success
+  assert_output --partial "createRouter"
+
+  # get_graph_schema needs --project like the other query tools. The agent
+  # instructions say to call it first, so a regression here is quietly expensive.
+  run ddev exec "${shim}" get_graph_schema
+  assert_success
+  assert_output --partial "node_labels"
+
+  # The point of the shim: compose with jq so only the answer is produced.
+  run ddev exec bash -c "${shim} search_graph --label Function | jq -c '[.results[] | {name}]'"
+  assert_success
+  assert_output --partial '{"name":"createRouter"}'
+  refute_output --partial '"fp"'
+
+  # A bad tool name fails loudly rather than emitting empty output.
+  run ddev exec "${shim}" no_such_tool
+  assert_failure
+
+  # One session serves repeated calls rather than one process per invocation.
+  run bash -c "ddev exec curl -sS http://codebase-memory:9760/health"
+  assert_success
+  assert_output --partial '"sessions": 1'
 }
 
 @test "foreign MCP entries survive install and removal" {
