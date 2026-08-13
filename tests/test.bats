@@ -230,6 +230,13 @@ health_checks() {
 
   # The graph actually contains this project's symbols, and the host command
   # quotes regex arguments so they survive the shell inside the container.
+  # `ddev cbm ui` has been broken outright before, by a `sed` on a missing .env
+  # file under `set -e`. Assert it runs and reports both a URL and a status.
+  run ddev cbm ui
+  assert_success
+  assert_output --partial "Graph UI:"
+  assert_output --partial "Status:"
+
   run ddev cbm search_graph --label Function --name-pattern '.*Router.*'
   assert_success
   assert_output --partial "createRouter"

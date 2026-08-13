@@ -102,8 +102,8 @@ case "${1:-}" in
 
   ui)
     shift
-    # Kept as a discoverability command: the UI has no on/off switch — it exists
-    # whenever an MCP session is open — so this reports where to find it.
+    # A discoverability command: there is nothing to switch on, so this reports
+    # where the UI lives and whether it is currently up.
     # The env file only exists once someone overrides a port; `|| true` keeps the
     # defaults working under `set -e` when it is absent.
     http_port="$(sed -n 's/^CBM_UI_HTTP_EXPOSE="\{0,1\}\([0-9]*\).*/\1/p' "${ENV_FILE}" 2>/dev/null | tail -1 || true)"
@@ -111,15 +111,24 @@ case "${1:-}" in
     echo "Graph UI:  http://${DDEV_SITENAME}.ddev.site:${http_port:-9760}"
     echo "           https://${DDEV_SITENAME}.ddev.site:${https_port:-9761}"
     echo ""
-    echo "It is served by the codebase-memory coordination daemon, which exists"
-    echo "only while at least one MCP session is open — start an agent first:"
-    echo "  ddev claude-code   or   ddev opencode"
+    echo "No agent needed: the bridge opens a short-lived session of its own on the"
+    echo "first request, so the graph is browsable on its own. The first load after"
+    echo "an idle spell takes a moment while that starts."
     echo ""
-    if in_container curl -sS -o /dev/null -w '%{http_code}' \
-         "http://127.0.0.1:9760/" 2>/dev/null | grep -q '^200$'; then
-      echo "Status: up (a session is open)"
+    # Ask /health rather than requesting the UI itself. A request to the UI would
+    # start the daemon, so a status command would have the side effect of spinning
+    # up a server process and holding it for the idle timeout.
+    health="$(in_container curl -sS --max-time 5 "http://127.0.0.1:9760/health" 2>/dev/null || true)"
+    # `ddev exec` starts a stopped project on its own, so reaching this means the
+    # container is up but the bridge did not answer, not that nothing is running.
+    if ! grep -q '"status"' <<<"${health}"; then
+      echo "Status: the bridge did not answer — see 'ddev cbm logs'"
+    elif grep -qE '"ui_keeper":[[:space:]]*true' <<<"${health}"; then
+      echo "Status: up (the bridge is holding a session open for the UI)"
+    elif grep -qE '"sessions":[[:space:]]*[1-9]' <<<"${health}"; then
+      echo "Status: up (an agent session is holding it open)"
     else
-      echo "Status: not running (no MCP session open)"
+      echo "Status: idle — the next request to the URL above starts it"
     fi
     ;;
 
