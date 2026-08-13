@@ -72,3 +72,16 @@ jobs:
           debug_enabled: ${{ github.event.inputs.debug_enabled }}
           addon_repository: ${{ env.GITHUB_REPOSITORY }}
           addon_ref: ${{ env.GITHUB_REF }}
+
+      # Without this a failure here is only readable by whoever can open the run
+      # logs, and an intermittent one is barely diagnosable at all. `teardown()`
+      # exports TESTDIR into GITHUB_ENV for exactly this purpose.
+      # See https://github.com/ddev/github-action-add-on-test#preserving-artifacts
+      - name: Preserve the test project on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: testdir-${{ matrix.ddev_version }}-${{ github.run_id }}
+          path: ${{ env.TESTDIR }}
+          if-no-files-found: warn
+          retention-days: 7
