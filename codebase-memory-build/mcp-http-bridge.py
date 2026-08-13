@@ -570,11 +570,27 @@ class UIProxyMixin:
                 return
             body = self.rfile.read(length)
 
+        authority = "%s:%d" % (UI_TARGET_HOST, UI_TARGET_PORT)
         headers = {}
+        had_origin = False
         for key, value in self.headers.items():
-            if key.lower() not in self.HOP_BY_HOP:
-                headers[key] = value
-        headers["Host"] = "%s:%d" % (UI_TARGET_HOST, UI_TARGET_PORT)
+            lowered = key.lower()
+            if lowered in self.HOP_BY_HOP:
+                continue
+            if lowered == "origin":
+                # Replaced below, not forwarded: see the rewrite.
+                had_origin = True
+                continue
+            headers[key] = value
+        headers["Host"] = authority
+        # The UI checks Origin against its own origin, the same DNS-rebinding
+        # defence as the Host check, and answers 403 to anything else — for the
+        # /assets/* bundle and every /api/* call alike. The asset tags carry
+        # `crossorigin`, so a browser always sends Origin, while curl sends none.
+        # Rewriting Host alone therefore looks perfectly healthy from the command
+        # line and renders a blank page in a browser.
+        if had_origin:
+            headers["Origin"] = "http://%s" % authority
         # Accept-Encoding is dropped so the upstream reply is not compressed:
         # this proxy buffers the body and rewrites Content-Length, and passing a
         # gzip body through with a recomputed length would corrupt it.
