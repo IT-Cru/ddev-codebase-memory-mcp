@@ -14,8 +14,10 @@ services:
       args:
         USER_UID: ${DDEV_UID:-1000}
         USER_GID: ${DDEV_GID:-1000}
-        CBM_VERSION: ${CBM_VERSION:-latest}
-        CBM_VARIANT: ${CBM_VARIANT:-ui}
+        # No default here on purpose: an empty value would override the pinned
+        # default in the Dockerfile. Passed through only when set, so the version
+        # has exactly one home — the ARG in Dockerfile.codebase-memory.
+        CBM_VERSION:
     labels:
       com.ddev.site-name: ${DDEV_SITENAME}
       com.ddev.approot: ${DDEV_APPROOT}
