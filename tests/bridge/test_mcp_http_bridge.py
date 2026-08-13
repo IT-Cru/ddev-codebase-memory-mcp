@@ -396,6 +396,7 @@ class FakeUI:
     def __init__(self):
         self.port = free_port()
         self.seen_hosts = []
+        self.seen_origins = []
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -406,8 +407,22 @@ class FakeUI:
 
             def _respond(self):
                 outer.seen_hosts.append(self.headers.get("Host"))
-                # Mimic the real UI: reject any Host that is not loopback.
+                outer.seen_origins.append(self.headers.get("Origin"))
+                # Mimic the real UI: reject any Host that is not loopback, and any
+                # Origin that is not this server's own. Both are DNS-rebinding
+                # defences, and the Origin one only fires for browser requests —
+                # curl sends no Origin at all.
                 host = (self.headers.get("Host") or "").split(":")[0]
+                origin = self.headers.get("Origin")
+                if origin is not None and origin != "http://%s" % (self.headers.get("Host") or ""):
+                    body = b"forbidden origin"
+                    self.send_response(403)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(body)
+                    return
                 if host not in ("127.0.0.1", "localhost"):
                     body = b"forbidden"
                     self.send_response(403)
@@ -453,12 +468,16 @@ class TestGraphUIProxy(unittest.TestCase):
         cls.bridge.stop()
         cls.ui.stop()
 
-    def _get(self, path="/", method="GET", body=None, host_header=None):
+    def _get(self, path="/", method="GET", body=None, host_header=None,
+             origin=None):
         url = "http://127.0.0.1:%d%s" % (self.bridge.ui_proxy_port, path)
         data = body.encode() if body else None
         req = urllib.request.Request(url, data=data, method=method)
         if host_header:
             req.add_header("Host", host_header)
+        # Browsers send this for the crossorigin-tagged assets; default it on so
+        # the proxy is exercised the way a browser exercises it.
+        req.add_header("Origin", origin or "http://127.0.0.1:%d" % self.bridge.ui_proxy_port)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return resp.status, dict(resp.headers), resp.read().decode()
@@ -474,6 +493,18 @@ class TestGraphUIProxy(unittest.TestCase):
         self.assertTrue(self.ui.seen_hosts[-1].startswith("127.0.0.1"),
                         "upstream saw Host=%r" % self.ui.seen_hosts[-1])
         self.assertEqual(headers.get("X-Upstream"), "fake-ui")
+
+    def test_rewrites_origin_as_well_as_host(self):
+        """Regression: the UI rejects a foreign Origin with 403, for /assets/* and
+        /api/* alike. Browsers always send one (the asset tags are `crossorigin`);
+        curl sends none — so forwarding it untouched passed every command-line check
+        and rendered a blank page in a browser."""
+        status, _, body = self._get(
+            "/assets/app.js", host_header="proj.ddev.site:9761")
+        self.assertEqual(status, 200, "foreign Origin was forwarded: %s" % (body,))
+        self.assertTrue(self.ui.seen_origins)
+        self.assertEqual(self.ui.seen_origins[-1],
+                         "http://127.0.0.1:%d" % self.ui.port)
 
     def test_preserves_path_and_query(self):
         status, _, body = self._get("/api/processes?a=1&b=2")
