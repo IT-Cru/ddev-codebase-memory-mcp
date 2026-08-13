@@ -21,6 +21,10 @@ ARG USER_GID
 #
 # "latest" is still accepted if you want it, and any tag can be pinned:
 #   ddev dotenv set .ddev/.env.codebase-memory --cbm-version=latest
+#
+# Keep in step with the CBM_VERSION build arg in
+# docker-compose.codebase-memory.yaml, which is what takes effect under DDEV; this
+# default covers a direct `docker build`.
 ARG CBM_VERSION=v0.10.3
 
 ENV DEBIAN_FRONTEND=noninteractive
