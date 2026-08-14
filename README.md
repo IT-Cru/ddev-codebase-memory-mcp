@@ -245,8 +245,7 @@ ddev dotenv set .ddev/.env.codebase-memory --cbm-workers=4
 | `CBM_WORKERS` | *(detected)* | Indexing threads. Worth setting: the binary sees **host** CPU count, not the container's quota |
 | `CBM_MEM_BUDGET_MB` | *(detected)* | Cap the in-memory graph budget, likewise derived from host RAM |
 | `CBM_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`, `none` |
-| `CBM_VERSION` | `latest` | Pin a release, e.g. `v0.9.0` (rebuild required) |
-| `CBM_VARIANT` | `ui` | `ui` or `default` (rebuild required) |
+| `CBM_VERSION` | `v0.10.3` | The `codebase-memory-mcp` release to install; `latest` or any tag (rebuild required) |
 | `CBM_BRIDGE_TOKEN` | *(unset)* | Require `Authorization: Bearer <token>` on `/mcp` (the UI stays open) |
 | `CBM_UI_KEEPER` | `true` | Open a short-lived session so the graph UI works with no agent running |
 | `CBM_UI_KEEPER_IDLE` | `900` | Seconds of no UI traffic before that session is released |
@@ -295,10 +294,12 @@ it once nobody is looking, so browsing the graph works on a project where you ne
 start an agent at all. Expect the first page load after an idle spell to take a
 moment while that comes up.
 
-The bridge reverse-proxies it, rewriting the `Host` header on the way through.
-That is what makes a `*.ddev.site` URL work at all: `codebase-memory-mcp` binds the
-UI to loopback and refuses any `Host` other than `localhost`, as DNS-rebinding
-protection.
+The bridge reverse-proxies it, rewriting the `Host` and `Origin` headers on the way
+through. That is what makes a `*.ddev.site` URL work at all: `codebase-memory-mcp`
+binds the UI to loopback and refuses any other `Host`, and any `Origin` but its own,
+as DNS-rebinding protection. Browsers send `Origin` for the UI's assets, so without
+that second rewrite the page loads blank while every request still looks healthy to
+`curl`.
 
 > **Coming from a non-DDEV install?** Your own `codebase-memory-mcp` keeps serving
 > its graph on <http://localhost:9749> — that is untouched. A DDEV project's graph

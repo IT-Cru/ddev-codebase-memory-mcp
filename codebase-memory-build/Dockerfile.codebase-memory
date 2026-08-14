@@ -12,14 +12,20 @@ ARG USERNAME=cbm
 ARG USER_UID
 ARG USER_GID
 
-# Release to install. "latest" tracks the newest GitHub release (a rebuild picks
-# up new versions); pin an exact tag (e.g. v0.9.0) for reproducible builds:
-#   ddev dotenv set .ddev/.env.codebase-memory --cbm-version=v0.9.0
-ARG CBM_VERSION=latest
-
-# "ui" also ships the graph visualization (~0.4 MB extra) so it can be enabled
-# at runtime without a rebuild. Use "default" for the plain server.
-ARG CBM_VARIANT=ui
+# Release to install, pinned to a version this add-on has been tested against.
+#
+# Deliberately not "latest". Upstream releases can change the published assets —
+# v0.10.0 dropped the separate UI archive — and with "latest" that lands as a
+# failed build on the next fresh image, with no warning and nothing changed on
+# this side. Pinning turns an upstream change into an add-on update instead.
+#
+# "latest" is still accepted if you want it, and any tag can be pinned:
+#   ddev dotenv set .ddev/.env.codebase-memory --cbm-version=latest
+#
+# Keep in step with the CBM_VERSION build arg in
+# docker-compose.codebase-memory.yaml, which is what takes effect under DDEV; this
+# default covers a direct `docker build`.
+ARG CBM_VERSION=v0.10.3
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV USERNAME=${USERNAME}
@@ -51,6 +57,10 @@ RUN python3 -c "import http.server, json, queue, subprocess, threading, uuid, so
 # Linux MUST use the "-portable" asset: the plain linux binary dynamically links
 # glibc 2.38+, while -portable is fully static. See upstream install.sh.
 #
+# One archive per platform, graph UI included. Upstream still publishes "ui-*"
+# copies so old updaters keep working, but those names are absent from
+# checksums.txt — verifying the download means using the canonical name.
+#
 # The binary is placed directly on PATH rather than via `<binary> install`,
 # which would also rewrite agent configs and manage a host PATH we do not want
 # inside an image layer.
@@ -60,11 +70,7 @@ RUN set -eux; \
       amd64|arm64) ;; \
       *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
     esac; \
-    if [ "${CBM_VARIANT}" = "ui" ]; then \
-      archive="codebase-memory-mcp-ui-linux-${arch}-portable.tar.gz"; \
-    else \
-      archive="codebase-memory-mcp-linux-${arch}-portable.tar.gz"; \
-    fi; \
+    archive="codebase-memory-mcp-linux-${arch}-portable.tar.gz"; \
     if [ "${CBM_VERSION}" = "latest" ]; then \
       base="https://github.com/DeusData/codebase-memory-mcp/releases/latest/download"; \
     else \

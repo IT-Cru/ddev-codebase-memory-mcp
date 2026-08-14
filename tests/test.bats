@@ -106,7 +106,10 @@ teardown() {
   # Persist TESTDIR if running inside GitHub Actions. Useful for uploading test result artifacts
   # See example at https://github.com/ddev/github-action-add-on-test#preserving-artifacts
   if [ -n "${GITHUB_ENV:-}" ]; then
-    [ -e "${GITHUB_ENV:-}" ] && echo "TESTDIR=${HOME}/tmp/${PROJNAME}" >> "${GITHUB_ENV}"
+    # Export the real directory, not "${HOME}/tmp/${PROJNAME}". TESTDIR comes from
+    # mktemp and carries a random suffix, so the un-suffixed path does not exist and
+    # the artifact upload silently found nothing to keep.
+    [ -e "${GITHUB_ENV:-}" ] && echo "TESTDIR=${TESTDIR}" >> "${GITHUB_ENV}"
   else
     [ "${TESTDIR}" != "" ] && rm -rf "${TESTDIR}"
   fi
@@ -230,6 +233,13 @@ health_checks() {
 
   # The graph actually contains this project's symbols, and the host command
   # quotes regex arguments so they survive the shell inside the container.
+  # `ddev cbm ui` has been broken outright before, by a `sed` on a missing .env
+  # file under `set -e`. Assert it runs and reports both a URL and a status.
+  run ddev cbm ui
+  assert_success
+  assert_output --partial "Graph UI:"
+  assert_output --partial "Status:"
+
   run ddev cbm search_graph --label Function --name-pattern '.*Router.*'
   assert_success
   assert_output --partial "createRouter"
@@ -332,10 +342,19 @@ PROBE
   run grep -q "Codebase Memory" "${TESTDIR}/ui.html"
   assert_success
 
-  # ...and that it was the keeper, not an agent, holding the daemon up.
+  # Still no agent session, which is the claim under test: the graph is browsable
+  # on its own.
+  #
+  # Deliberately not asserting `"ui_keeper": true` here. The keeper only opens a
+  # session when nothing else is holding the daemon, and since 0.10.x everything
+  # shares one — including the background first-run index, which is still running
+  # on a slow machine when this test reaches the UI. The UI is then served without
+  # a keeper ever being needed, which is correct behaviour and made this assertion
+  # flaky. The keeper itself is covered deterministically in tests/bridge, where
+  # the UI target is a port under the test's control.
   run bash -c "ddev exec curl -sS http://codebase-memory:9760/health"
   assert_success
-  assert_output --partial '"ui_keeper": true'
+  assert_output --partial '"sessions": 0'
 }
 
 @test "MCP is reachable from the host through the ddev router" {
