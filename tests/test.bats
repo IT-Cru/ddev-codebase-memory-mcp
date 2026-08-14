@@ -384,10 +384,10 @@ PROBE
 
 @test "the cbm shim queries the graph from inside a container" {
   set -eu -o pipefail
-  # Agent containers mount the project but have no ddev binary and no MCP client,
-  # so the shim is how an agent can pipe graph results through jq instead of
-  # pulling whole tool responses into its context. Driven from the web container,
-  # which sits in the same place on the project network.
+  # Agent containers mount the project but have no ddev binary and no MCP client, so
+  # the shim is how an agent chains several graph queries in one round-trip instead
+  # of one per step. Driven from the web container, which sits in the same place on
+  # the project network.
   run ddev add-on get "${DIR}"
   assert_success
   run ddev restart -y
@@ -412,11 +412,37 @@ PROBE
   assert_success
   assert_output --partial "node_labels"
 
-  # The point of the shim: compose with jq so only the answer is produced.
-  run ddev exec bash -c "${shim} search_graph --label Function | jq -c '[.results[] | {name}]'"
+  # The point of the shim: chain steps in one round-trip. Sent as a script rather
+  # than a `bash -c` string — `ddev exec` hands the command to a shell of its own,
+  # which eats awk's $1 and the nested quoting. This is also how an agent would
+  # really do it.
+  #
+  # It doubles as the output contract the agent instructions describe: the query
+  # surface answers in a compact tree, sliced with awk, while get_code_snippet
+  # still answers in JSON.
+  local probe
+  probe="$(mktemp)"
+  cat > "${probe}" <<'CHAIN'
+set -u
+CBM=/var/www/html/.ddev/codebase-memory/cbm
+out="$("$CBM" search_graph --label Function --name-pattern '.*Router.*')"
+printf '%s\n' "$out" | awk '/^  [A-Za-z]/ {print "ROW " $1}'
+prefix="$(printf '%s\n' "$out" | sed -n 's/^\(var-www-html[^ ]*\) (.*/\1/p')"
+name="$(printf '%s\n' "$out" | awk '/^  [A-Za-z]/ {print $1; exit}')"
+echo "QN ${prefix}.${name}"
+"$CBM" get_code_snippet --qualified-name "${prefix}.${name}"
+CHAIN
+  docker cp "${probe}" "ddev-${PROJNAME}-web:/tmp/cbm-chain.sh" >/dev/null
+  rm -f "${probe}"
+
+  run ddev exec bash /tmp/cbm-chain.sh
   assert_success
-  assert_output --partial '{"name":"createRouter"}'
-  refute_output --partial '"fp"'
+  # The tree row parsed with awk...
+  assert_output --partial "ROW createRouter"
+  # ...composed into a qualified name...
+  assert_output --partial "QN var-www-html.src.app.createRouter"
+  # ...and used to fetch the source in the same round-trip.
+  assert_output --partial "createRouter"
 
   # A bad tool name fails loudly rather than emitting empty output.
   run ddev exec "${shim}" no_such_tool

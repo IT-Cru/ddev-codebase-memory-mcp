@@ -4,21 +4,27 @@
 # cbm — query the codebase knowledge graph from inside a container.
 #
 # Meant for AI agent containers (ddev-claude-code, ddev-opencode) and the web
-# container: anything on the project's Docker network. Prints the tool's JSON
-# result on stdout and nothing else, so it composes with jq.
+# container: anything on the project's Docker network. Prints the tool's result on
+# stdout and nothing else, so it composes in a shell script.
 #
 #   cbm get_graph_schema
 #   cbm search_graph --label Function --name-pattern '.*Handler.*'
 #   cbm trace_path --function-name handle --direction both
 #   cbm query_graph --query 'MATCH (f:Function) RETURN f.name LIMIT 5'
 #
-# Why this exists: calling the MCP tools directly puts every byte of a result
-# into the agent's context, and graph results carry per-node fields no one reads
-# (fingerprints, metric vectors). Piping through jq keeps the answer and drops
-# the rest:
+# Why this exists: not payload size — the server already returns a compact tree
+# format. It is round-trips. Every MCP tool call sends the whole conversation
+# through the model again, so a four-step question costs four inferences. A script
+# that chains those steps costs one, and returns only what it was asked for:
 #
-#   cbm search_graph --label Function \
-#     | jq '[.results[] | {name, file_path, out_degree}] | sort_by(-.out_degree) | .[:5]'
+#   out="$(cbm search_graph --label Class)"
+#   for name in $(printf '%s\n' "$out" | awk '/^  [A-Za-z]/ {print $1}'); do
+#     cbm get_code_snippet --qualified-name "<group>.$name"
+#   done
+#
+# Output format varies by tool: the query surface returns a compact tree, while
+# some tools (get_code_snippet among them) still return JSON. Do not assume either
+# — look before you pipe.
 #
 # Requires: curl, jq. No ddev binary and no MCP client needed.
 
@@ -38,7 +44,7 @@ usage() {
   cat <<'EOF'
 cbm — query the codebase knowledge graph
 
-  cbm <tool> [--flag value ...]        run a graph tool, print its JSON result
+  cbm <tool> [--flag value ...]        run a graph tool, print its result
   cbm --tools                          list the available tools
   cbm --help                           this text
 
@@ -47,14 +53,17 @@ filled in automatically for tools that need it.
 
 Examples
   cbm get_graph_schema
-  cbm get_architecture | jq '.languages'
-  cbm search_graph --label Class | jq -r '.results[].qualified_name'
-  cbm search_graph --label Function --name-pattern '.*Handler.*' \
-    | jq '[.results[] | {name, file_path, in_degree}]'
-  cbm trace_path --function-name handle --direction both \
-    | jq '{callers: [.callers[].name], callees: [.callees[].name]}'
+  cbm get_architecture
+  cbm search_graph --label Class
+  cbm search_graph --label Function --name-pattern '.*Handler.*' --limit 20
+  cbm trace_path --function-name handle --direction both
   cbm query_graph --query 'MATCH (f:Function) WHERE f.out_degree > 3 RETURN f.name, f.out_degree'
-  cbm get_code_snippet --qualified-name var-www-html.src.app.createRouter | jq -r '.source'
+  cbm get_code_snippet --qualified-name var-www-html.src.app.createRouter
+
+The query tools answer in a compact tree: a group line per file, then one row per
+symbol. Slice it with awk rather than jq — it is not JSON:
+
+  cbm search_graph --label Function | awk '/^  [A-Za-z]/ {print $1}'
 
 Prefer query_graph with an explicit RETURN for anything multi-hop: one call, and
 only the fields you asked for.

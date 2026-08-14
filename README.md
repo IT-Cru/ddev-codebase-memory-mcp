@@ -113,23 +113,29 @@ to `CLAUDE.md`:
 For OpenCode, add the path to the `instructions` array in your `opencode.json`.
 
 **A shell shim.** `.ddev/codebase-memory/cbm` runs any graph tool from inside a
-container — agent containers mount the project but have no `ddev` binary — and
-prints only the JSON result, so it pipes:
+container — agent containers mount the project but have no `ddev` binary — and prints
+only the tool's result, so it composes in a script:
 
 ```bash
-.ddev/codebase-memory/cbm search_graph --label Function \
-  | jq '[.results[] | {name, file_path, out_degree}] | sort_by(-.out_degree) | .[:5]'
+CBM=.ddev/codebase-memory/cbm
+out="$($CBM search_graph --label Class)"
+prefix="$(printf '%s\n' "$out" | sed -n 's/^\(var-www-html[^ ]*\) (.*/\1/p')"
+for name in $(printf '%s\n' "$out" | awk '/^  [A-Za-z]/ {print $1}'); do
+  "$CBM" get_code_snippet --qualified-name "$prefix.$name"
+done
 ```
 
-This matters more than it looks. Calling an MCP tool puts its entire response into
-the agent's context, and graph results carry per-node fields nobody reads —
-fingerprints, metric vectors, a dozen complexity counters. On a three-function
-project that one pipeline is **2123 bytes of tool result reduced to 182** (~91%), and
-the ratio comes from per-node fields, so it grows with the result set. Filtering in a
-shell keeps the answer and drops the rest.
+What that buys is **round-trips, not payload size**. Every MCP tool call sends the
+whole conversation through the model again, so a question that fans out over ten
+symbols costs eleven inferences; the script above costs one. Payload size is already
+handled upstream — the query tools answer in a compact tree format, so there is
+nothing left for us to trim.
 
-It reuses one MCP session across calls, so a pipeline of several queries does not
-start a server process per invocation, and re-initializes by itself if the container
+Note the query surface is **not JSON** — slice it with `awk`, not `jq`. Some tools,
+`get_code_snippet` among them, still answer in JSON, so check rather than assume.
+
+It reuses one MCP session across calls, so a script of several queries does not start
+a server process per invocation, and re-initializes by itself if the container
 restarted. `cbm --help` has more examples.
 
 `--project` is filled in with `var-www-html`, which is what CBM derives from the
