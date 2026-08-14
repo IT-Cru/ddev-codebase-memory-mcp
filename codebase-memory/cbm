@@ -197,8 +197,9 @@ if jq -e 'has("error")' >/dev/null 2>&1 <<<"$RESPONSE"; then
   exit 1
 fi
 
-# Tool results arrive as text content holding JSON. Emit that JSON so the output
-# pipes into jq; fall back to the raw text if it is not JSON.
+# The result is text content inside the JSON-RPC envelope. Most tools put a compact
+# tree in there, some still put JSON — so emit it verbatim, pretty-printing only when
+# it really is JSON. Either way stdout carries the tool's answer and nothing else.
 TEXT="$(jq -r '.result.content[0].text // empty' <<<"$RESPONSE")"
 if [ -n "$TEXT" ]; then
   if jq -e . >/dev/null 2>&1 <<<"$TEXT"; then
