@@ -556,6 +556,19 @@ TWIGEOF
   assert_output "absent"
   run jq -r '.mcp["codebase-memory"] // "absent"' "${TESTDIR}/opencode.json"
   assert_output "absent"
+
+  # ...and stays absent. The entrypoint's registration watchdog re-checks for about
+  # half a minute after container start, and used to put the entry back seconds after
+  # removal stripped it — checking only the instant after `add-on remove` missed that
+  # entirely. Removal now takes the container down first; wait out the old window to
+  # prove nothing resurrects it.
+  run bash -c "docker ps --format '{{.Names}}' | grep -c 'ddev-${PROJNAME}-codebase-memory' || true"
+  assert_output "0"
+  sleep 40
+  run jq -r '.mcpServers["codebase-memory"] // "absent"' "${TESTDIR}/.mcp.json"
+  assert_output "absent"
+  run jq -r '.mcp["codebase-memory"] // "absent"' "${TESTDIR}/opencode.json"
+  assert_output "absent"
 }
 
 # bats test_tags=release

@@ -164,6 +164,23 @@ post_install_actions:
 
 removal_actions:
   - |
+    #ddev-description:Stopping the graph service
+    # Must happen before the client configs are edited. The container's entrypoint
+    # re-checks the registration for about half a minute after start, so that a
+    # sibling add-on rewriting .mcp.json cannot drop our entry. That watchdog guards
+    # on this compose file existing — and it still exists while removal_actions run,
+    # so a tick landing just after the next action strips the entry puts it straight
+    # back. Remove the file first so any later tick gives up, then take the container
+    # down so none can be in flight.
+    COMPOSE="${DDEV_APPROOT}/.ddev/docker-compose.codebase-memory.yaml"
+    if [ -f "$COMPOSE" ] && grep -q '#ddev-generated' "$COMPOSE"; then
+      rm -f "$COMPOSE"
+    fi
+    if docker rm -f "ddev-${DDEV_SITENAME}-codebase-memory" >/dev/null 2>&1; then
+      echo "Stopped the codebase-memory container"
+    fi
+
+  - |
     #ddev-description:Deregistering from AI client configs
     # Remove only our own key, and only from valid JSON, so hand-added MCP
     # servers in these shared files survive.
