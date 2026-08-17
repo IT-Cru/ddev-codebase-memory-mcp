@@ -244,6 +244,12 @@ health_checks() {
   assert_success
   assert_output --partial "createRouter"
 
+  # --project is auto-filled for get_graph_schema too, which the README tells
+  # people to run first.
+  run ddev cbm get_graph_schema
+  assert_success
+  assert_output --partial "node_labels"
+
   # Exactly one project: a second, redundant graph appears if the pre-index and
   # a session's auto-index disagree about the project name.
   run bash -c "ddev cbm list_projects 2>/dev/null | tail -1 | jq '.projects | length'"
@@ -374,6 +380,78 @@ PROBE
   # The session id header is what a host client needs for follow-up calls.
   run grep -qi '^Mcp-Session-Id:' "${TESTDIR}/mcp-h"
   assert_success
+}
+
+@test "the cbm shim queries the graph from inside a container" {
+  set -eu -o pipefail
+  # Agent containers mount the project but have no ddev binary and no MCP client, so
+  # the shim is how an agent chains several graph queries in one round-trip instead
+  # of one per step. Driven from the web container, which sits in the same place on
+  # the project network.
+  run ddev add-on get "${DIR}"
+  assert_success
+  run ddev restart -y
+  assert_success
+  wait_for_index
+
+  local shim=/var/www/html/.ddev/codebase-memory/cbm
+
+  run ddev exec "${shim}" --tools
+  assert_success
+  assert_output --partial "search_graph"
+  assert_output --partial "query_graph"
+
+  # --project is filled in automatically, and --name-pattern maps to name_pattern.
+  run ddev exec "${shim}" search_graph --label Function --name-pattern '.*Router.*'
+  assert_success
+  assert_output --partial "createRouter"
+
+  # get_graph_schema needs --project like the other query tools. The agent
+  # instructions say to call it first, so a regression here is quietly expensive.
+  run ddev exec "${shim}" get_graph_schema
+  assert_success
+  assert_output --partial "node_labels"
+
+  # The point of the shim: chain steps in one round-trip. Sent as a script rather
+  # than a `bash -c` string — `ddev exec` hands the command to a shell of its own,
+  # which eats awk's $1 and the nested quoting. This is also how an agent would
+  # really do it.
+  #
+  # It doubles as the output contract the agent instructions describe: the query
+  # surface answers in a compact tree, sliced with awk, while get_code_snippet
+  # still answers in JSON.
+  local probe
+  probe="$(mktemp)"
+  cat > "${probe}" <<'CHAIN'
+set -u
+CBM=/var/www/html/.ddev/codebase-memory/cbm
+out="$("$CBM" search_graph --label Function --name-pattern '.*Router.*')"
+printf '%s\n' "$out" | awk '/^  [A-Za-z]/ {print "ROW " $1}'
+prefix="$(printf '%s\n' "$out" | sed -n 's/^\(var-www-html[^ ]*\) (.*/\1/p')"
+name="$(printf '%s\n' "$out" | awk '/^  [A-Za-z]/ {print $1; exit}')"
+echo "QN ${prefix}.${name}"
+"$CBM" get_code_snippet --qualified-name "${prefix}.${name}"
+CHAIN
+  docker cp "${probe}" "ddev-${PROJNAME}-web:/tmp/cbm-chain.sh" >/dev/null
+  rm -f "${probe}"
+
+  run ddev exec bash /tmp/cbm-chain.sh
+  assert_success
+  # The tree row parsed with awk...
+  assert_output --partial "ROW createRouter"
+  # ...composed into a qualified name...
+  assert_output --partial "QN var-www-html.src.app.createRouter"
+  # ...and used to fetch the source in the same round-trip.
+  assert_output --partial "createRouter"
+
+  # A bad tool name fails loudly rather than emitting empty output.
+  run ddev exec "${shim}" no_such_tool
+  assert_failure
+
+  # One session serves repeated calls rather than one process per invocation.
+  run bash -c "ddev exec curl -sS http://codebase-memory:9760/health"
+  assert_success
+  assert_output --partial '"sessions": 1'
 }
 
 @test "foreign MCP entries survive install and removal" {

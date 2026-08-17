@@ -95,6 +95,55 @@ and more. This add-on is a natural companion to it: install in either order, no
 configuration, nothing owned by another add-on is modified. See
 [Use with ddev-ai-workspace](#use-with-ddev-ai-workspace).
 
+### Getting more out of an agent
+
+Two things ship with the add-on to make agents use the graph well rather than
+falling back to grep.
+
+**Instructions.** `.ddev/codebase-memory/AGENT-INSTRUCTIONS.md` tells an agent which
+tool answers which question, to call `get_graph_schema` first, and to prefer one
+`query_graph` call over a chain of narrower ones. Reference it from your own
+instruction file rather than having it installed over the top — for Claude Code, add
+to `CLAUDE.md`:
+
+```
+@.ddev/codebase-memory/AGENT-INSTRUCTIONS.md
+```
+
+For OpenCode, add the path to the `instructions` array in your `opencode.json`.
+
+**A shell shim.** `.ddev/codebase-memory/cbm` runs any graph tool from inside a
+container — agent containers mount the project but have no `ddev` binary — and prints
+only the tool's result, so it composes in a script:
+
+```bash
+CBM=.ddev/codebase-memory/cbm
+out="$($CBM search_graph --label Class)"
+prefix="$(printf '%s\n' "$out" | sed -n 's/^\(var-www-html[^ ]*\) (.*/\1/p')"
+for name in $(printf '%s\n' "$out" | awk '/^  [A-Za-z]/ {print $1}'); do
+  "$CBM" get_code_snippet --qualified-name "$prefix.$name"
+done
+```
+
+What that buys is **round-trips, not payload size**. Every MCP tool call sends the
+whole conversation through the model again, so a question that fans out over ten
+symbols costs eleven inferences; the script above costs one. Payload size is already
+handled upstream — the query tools answer in a compact tree format, so there is
+nothing left for us to trim.
+
+Note the query surface is **not JSON** — slice it with `awk`, not `jq`. Some tools,
+`get_code_snippet` among them, still answer in JSON, so check rather than assume.
+
+It reuses one MCP session across calls, so a script of several queries does not start
+a server process per invocation, and re-initializes by itself if the container
+restarted. `cbm --help` has more examples.
+
+`--project` is filled in with `var-www-html`, which is what CBM derives from the
+container mount path — so it holds whatever your DDEV project is called. It would
+only be wrong if you indexed under a custom `--name` or from a subdirectory, and in
+that case the server answers with the names it does have; `CBM_PROJECT` overrides the
+default.
+
 ### Other MCP clients
 
 Any client that speaks MCP over HTTP can use the same endpoint. From inside the

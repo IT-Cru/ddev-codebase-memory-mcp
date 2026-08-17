@@ -41,6 +41,9 @@ pre_install_actions:
 
 project_files:
   - docker-compose.codebase-memory.yaml
+  # Reachable from any container on the project network, including the AI agent
+  # containers, which mount the project but have no ddev binary.
+  - codebase-memory/
   # Directory form: everything under it belongs to this add-on, so removal takes
   # the directory with it instead of leaving an empty shell behind.
   - codebase-memory-build/
@@ -102,14 +105,18 @@ post_install_actions:
     echo "  .mcp.json      -> Claude Code   (ddev claude-code)"
     echo "  opencode.json  -> OpenCode      (ddev opencode)"
     echo ""
-    echo "The graph UI is served while an agent session is open:"
-    echo "  https://${DDEV_SITENAME}.ddev.site:9761"
+    echo "Browse the graph (no agent needed):"
+    echo "  http://${DDEV_SITENAME}.ddev.site:9760"
     echo ""
     echo "Handy commands:"
     echo "  ddev cbm index                 # re-index the project"
     echo "  ddev cbm list_projects         # what is in the graph"
     echo "  ddev cbm ui                    # graph UI URL and status"
     echo "  ddev cbm --help                # all tools"
+    echo ""
+    echo "Inside containers (AI agents, web) the graph is queryable with:"
+    echo "  .ddev/codebase-memory/cbm --help"
+    echo "Point your agents at .ddev/codebase-memory/AGENT-INSTRUCTIONS.md"
     echo ""
 
 removal_actions:
