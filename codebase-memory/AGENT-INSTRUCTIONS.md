@@ -1,6 +1,10 @@
 # Codebase graph — instructions for AI agents
 
-<!-- ddev-generated -->
+<!-- #ddev-generated -->
+<!-- The "#" is required: DDEV matches that exact literal to decide the file is safe to
+     replace on update and to remove on uninstall. Without it this file, and the
+     directory holding it, are left behind. -->
+
 
 This project has a queryable knowledge graph of its own source: functions, classes,
 call chains, imports and HTTP routes, kept current automatically. Query it instead of

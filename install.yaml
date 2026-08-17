@@ -164,20 +164,25 @@ post_install_actions:
 
 removal_actions:
   - |
-    #ddev-description:Stopping the graph service
-    # Must happen before the client configs are edited. The container's entrypoint
+    #ddev-description:Retiring the graph service
+    # Must run before the client configs are edited. The container's entrypoint
     # re-checks the registration for about half a minute after start, so that a
-    # sibling add-on rewriting .mcp.json cannot drop our entry. That watchdog guards
-    # on this compose file existing — and it still exists while removal_actions run,
-    # so a tick landing just after the next action strips the entry puts it straight
-    # back. Remove the file first so any later tick gives up, then take the container
-    # down so none can be in flight.
+    # sibling add-on rewriting .mcp.json cannot drop our entry. That watchdog gives up
+    # once this compose file is gone — but the file is still present while
+    # removal_actions run, so a tick landing just after the next action strips the
+    # entry would put it straight back.
+    #
+    # Removing the file here retires the watchdog. DDEV deletes it again later along
+    # with the rest of project_files, which is harmless. The short settle covers a
+    # tick that had already passed the check and is mid-write: those take
+    # milliseconds, so a second is ample. The container itself is left running and
+    # simply not recreated on the next `ddev restart`, which is how DDEV's own
+    # removal behaves.
     COMPOSE="${DDEV_APPROOT}/.ddev/docker-compose.codebase-memory.yaml"
     if [ -f "$COMPOSE" ] && grep -q '#ddev-generated' "$COMPOSE"; then
       rm -f "$COMPOSE"
-    fi
-    if docker rm -f "ddev-${DDEV_SITENAME}-codebase-memory" >/dev/null 2>&1; then
-      echo "Stopped the codebase-memory container"
+      echo "Retired the registration watchdog"
+      sleep 1
     fi
 
   - |

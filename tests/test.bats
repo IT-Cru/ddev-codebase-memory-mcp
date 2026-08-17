@@ -559,11 +559,12 @@ TWIGEOF
 
   # ...and stays absent. The entrypoint's registration watchdog re-checks for about
   # half a minute after container start, and used to put the entry back seconds after
-  # removal stripped it — checking only the instant after `add-on remove` missed that
-  # entirely. Removal now takes the container down first; wait out the old window to
-  # prove nothing resurrects it.
-  run bash -c "docker ps --format '{{.Names}}' | grep -c 'ddev-${PROJNAME}-codebase-memory' || true"
-  assert_output "0"
+  # removal stripped it. Asserting only on the instant after `add-on remove` missed
+  # that completely, so wait out the whole window and read both files again.
+  #
+  # The container is deliberately still running here — removal retires the watchdog by
+  # deleting the compose file rather than by killing the container, matching how DDEV
+  # removes an add-on. So this is the assertion that has to hold.
   sleep 40
   run jq -r '.mcpServers["codebase-memory"] // "absent"' "${TESTDIR}/.mcp.json"
   assert_output "absent"
