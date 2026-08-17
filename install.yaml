@@ -72,6 +72,41 @@ post_install_actions:
     fi
 
   - |
+    #ddev-description:Mapping Drupal file extensions
+    # Drupal keeps real code in .module, .install, .theme and .profile files, and the
+    # indexer goes by extension — so hooks, schema and update functions, and theme
+    # preprocessors are all invisible to the graph by default. On a test project
+    # those files contributed 0 of 0 indexed functions before this mapping and 7 of 7
+    # after, call edges included.
+    #
+    # Only Drupal (and Backdrop, same file layout) needs this. WordPress, TYPO3 and
+    # Laravel put their code in .php, which is indexed already — .blade.php included,
+    # since it ends in .php. Twig templates are left out on purpose: they define no
+    # functions or classes, so mapping them adds file nodes and little else.
+    case "${DDEV_PROJECT_TYPE:-}" in
+      drupal*|backdrop*)
+        CBM_CONFIG="${DDEV_APPROOT}/.codebase-memory.json"
+        if [ ! -e "$CBM_CONFIG" ]; then
+          cat > "$CBM_CONFIG" <<'EOF'
+    {
+      "extra_extensions": {
+        ".module": "php",
+        ".install": "php",
+        ".theme": "php",
+        ".profile": "php",
+        ".engine": "php",
+        ".inc": "php"
+      }
+    }
+    EOF
+          echo "Created .codebase-memory.json (indexes Drupal .module/.install/.theme as PHP)"
+        else
+          echo "Kept existing .codebase-memory.json — add Drupal extensions yourself if you want them indexed"
+        fi
+        ;;
+    esac
+
+  - |
     #ddev-description:Seeding .cbmignore
     # Without this, DDEV's own config is indexed as if it were application code:
     # the shell functions in this add-on's entrypoint.sh alone accounted for most

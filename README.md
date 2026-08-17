@@ -224,6 +224,7 @@ there.
 | `.mcp.json` | Claude Code MCP registration (`codebase-memory` key only) |
 | `opencode.json` | OpenCode MCP registration (`codebase-memory` key only) |
 | `.cbmignore` | Excludes `.ddev/` from the graph — created only if absent |
+| `.codebase-memory.json` | Drupal projects only: indexes `.module`/`.install`/`.theme` as PHP — created only if absent |
 
 Both JSON files are shared with other add-ons, so registration **merges**: other
 MCP servers, your `model` setting, and anything else you added are preserved, and
@@ -235,6 +236,24 @@ server without extra setup.
 The `.cbmignore` excludes `.ddev/` because DDEV's config directory contains shell
 scripts that would otherwise be indexed as application code and appear in search
 and trace results.
+
+### Drupal file extensions
+
+On a Drupal or Backdrop project, install writes a `.codebase-memory.json` mapping
+`.module`, `.install`, `.theme`, `.profile`, `.engine` and `.inc` to PHP. The indexer
+decides how to parse a file from its extension, so without that mapping every hook,
+schema and update function, and every theme preprocessor is missing from the graph —
+on a test project those files contributed **0 of 0** indexed functions before the
+mapping and **7 of 7** after, call edges included.
+
+Other project types get nothing, deliberately. WordPress, TYPO3 and Laravel keep their
+code in `.php`, which is indexed already — `.blade.php` included, since it ends in
+`.php`. Twig templates are left out because they define no functions or classes, so
+mapping them would add file nodes and little else.
+
+Delete or edit the file if you disagree; it is only created when absent. To check what
+the graph is missing in your own project, ask for
+`check_index_coverage --paths <file>` — `not_tracked` means the indexer skipped it.
 
 ## Configuration
 

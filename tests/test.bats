@@ -211,6 +211,11 @@ health_checks() {
   # DDEV config is kept out of the graph
   assert_file_exist "${TESTDIR}/.cbmignore"
 
+  # The Drupal extension mapping is seeded only for Drupal-shaped projects. This
+  # one is type `php`, whose code is in .php already, so shipping a config here
+  # would be noise.
+  assert_file_not_exist "${TESTDIR}/.codebase-memory.json"
+
   wait_for_index
 
   # The end-to-end contract: a JSON-RPC session over HTTP from a *different*
@@ -452,6 +457,45 @@ CHAIN
   run bash -c "ddev exec curl -sS http://codebase-memory:9760/health"
   assert_success
   assert_output --partial '"sessions": 1'
+}
+
+@test "a Drupal project indexes .module, .install and .theme files" {
+  set -eu -o pipefail
+  # Drupal keeps hooks, schema/update functions and theme preprocessors in files the
+  # indexer would otherwise skip on extension, so none of that code reaches the graph
+  # without a mapping. Reconfigure this project as Drupal and prove the difference.
+  mkdir -p "${TESTDIR}/web/modules/custom/mymod"
+  cat > "${TESTDIR}/web/modules/custom/mymod/mymod.module" <<'PHPEOF'
+<?php
+function mymod_node_presave($node) { return mymod_helper_normalize($node); }
+function mymod_helper_normalize($entity) { return TRUE; }
+PHPEOF
+  cat > "${TESTDIR}/web/modules/custom/mymod/mymod.install" <<'PHPEOF'
+<?php
+function mymod_update_10001() { return 'updated'; }
+PHPEOF
+
+  run ddev config --project-name="${PROJNAME}" --project-type=drupal11 --docroot=web
+  assert_success
+  run ddev add-on get "${DIR}"
+  assert_success
+
+  # Seeded for this project type, unlike the php project in health_checks.
+  assert_file_exist "${TESTDIR}/.codebase-memory.json"
+  run jq -r '.extra_extensions[".module"]' "${TESTDIR}/.codebase-memory.json"
+  assert_success
+  assert_output "php"
+
+  run ddev_start_with_retry
+  assert_success
+  wait_for_index
+
+  # The payoff: functions from those files are in the graph, with their call edges.
+  run ddev cbm search_graph --label Function
+  assert_success
+  assert_output --partial "mymod_node_presave"
+  assert_output --partial "mymod_helper_normalize"
+  assert_output --partial "mymod_update_10001"
 }
 
 @test "foreign MCP entries survive install and removal" {
