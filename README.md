@@ -284,7 +284,7 @@ ddev dotenv set .ddev/.env.codebase-memory --cbm-workers=4
 | `CBM_WORKERS` | *(detected)* | Indexing threads. Worth setting: the binary sees **host** CPU count, not the container's quota |
 | `CBM_MEM_BUDGET_MB` | *(detected)* | Cap the in-memory graph budget, likewise derived from host RAM |
 | `CBM_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`, `none` |
-| `CBM_VERSION` | `v0.10.3` | The `codebase-memory-mcp` release to install; `latest` or any tag (rebuild required) |
+| `CBM_VERSION` | `v0.10.6` | The `codebase-memory-mcp` release to install; `latest` or any tag (rebuild required) |
 | `CBM_BRIDGE_TOKEN` | *(unset)* | Require `Authorization: Bearer <token>` on `/mcp` (the UI stays open) |
 | `CBM_UI_KEEPER` | `true` | Open a short-lived session so the graph UI works with no agent running |
 | `CBM_UI_KEEPER_IDLE` | `900` | Seconds of no UI traffic before that session is released |
