@@ -18,7 +18,7 @@ services:
         # the value that actually takes effect; the ARG default only applies to a
         # direct `docker build`. Spelled out rather than left null to resolve from
         # the environment, because that relies on compose-version behaviour.
-        CBM_VERSION: ${CBM_VERSION:-v0.10.3}
+        CBM_VERSION: ${CBM_VERSION:-v0.10.6}
     labels:
       com.ddev.site-name: ${DDEV_SITENAME}
       com.ddev.approot: ${DDEV_APPROOT}
