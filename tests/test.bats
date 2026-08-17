@@ -211,6 +211,11 @@ health_checks() {
   # DDEV config is kept out of the graph
   assert_file_exist "${TESTDIR}/.cbmignore"
 
+  # The Drupal extension mapping is seeded only for Drupal-shaped projects. This
+  # one is type `php`, whose code is in .php already, so shipping a config here
+  # would be noise.
+  assert_file_not_exist "${TESTDIR}/.codebase-memory.json"
+
   wait_for_index
 
   # The end-to-end contract: a JSON-RPC session over HTTP from a *different*
@@ -454,6 +459,74 @@ CHAIN
   assert_output --partial '"sessions": 1'
 }
 
+@test "a Drupal project indexes .module, .install and .theme files" {
+  set -eu -o pipefail
+  # Drupal keeps hooks, schema/update functions and theme preprocessors in files the
+  # indexer would otherwise skip on extension, so none of that code reaches the graph
+  # without a mapping. Reconfigure this project as Drupal and prove the difference.
+  mkdir -p "${TESTDIR}/web/modules/custom/mymod"
+  cat > "${TESTDIR}/web/modules/custom/mymod/mymod.module" <<'PHPEOF'
+<?php
+function mymod_node_presave($node) { return mymod_helper_normalize($node); }
+function mymod_helper_normalize($entity) { return TRUE; }
+PHPEOF
+  cat > "${TESTDIR}/web/modules/custom/mymod/mymod.install" <<'PHPEOF'
+<?php
+function mymod_update_10001() { return 'updated'; }
+PHPEOF
+  # A custom Twig function, defined in PHP and called from a template. Finding the
+  # call sites is only possible if templates are indexed — search_code looks inside
+  # indexed files only.
+  mkdir -p "${TESTDIR}/web/themes/custom/mytheme/templates" \
+           "${TESTDIR}/web/modules/custom/mymod/src"
+  cat > "${TESTDIR}/web/modules/custom/mymod/src/MyTwig.php" <<'PHPEOF'
+<?php
+namespace Drupal\mymod;
+class MyTwig {
+  public function getFunctions() { return ['mymod_badge' => 'x']; }
+}
+PHPEOF
+  cat > "${TESTDIR}/web/themes/custom/mytheme/templates/node.html.twig" <<'TWIGEOF'
+{% block content %}<div>{{ mymod_badge(node.id) }}</div>{% endblock %}
+TWIGEOF
+
+  run ddev config --project-name="${PROJNAME}" --project-type=drupal11 --docroot=web
+  assert_success
+  run ddev add-on get "${DIR}"
+  assert_success
+
+  # Seeded for this project type, unlike the php project in health_checks.
+  assert_file_exist "${TESTDIR}/.codebase-memory.json"
+  run jq -r '.extra_extensions[".module"]' "${TESTDIR}/.codebase-memory.json"
+  assert_success
+  assert_output "php"
+
+  run ddev_start_with_retry
+  assert_success
+  wait_for_index
+
+  # The payoff: functions from those files are in the graph, with their call edges.
+  run ddev cbm search_graph --label Function
+  assert_success
+  assert_output --partial "mymod_node_presave"
+  assert_output --partial "mymod_helper_normalize"
+  assert_output --partial "mymod_update_10001"
+
+  # Templates are indexed too, so a custom Twig function can be traced from its PHP
+  # definition to the templates that call it.
+  run jq -r '.extra_extensions[".twig"]' "${TESTDIR}/.codebase-memory.json"
+  assert_output "html"
+  run ddev cbm search_code --pattern mymod_badge
+  assert_success
+  assert_output --partial "MyTwig.php"
+  assert_output --partial "node.html.twig"
+
+  # ...without templates leaking into code-symbol searches.
+  run ddev cbm search_graph --label Function
+  assert_success
+  refute_output --partial ".twig"
+}
+
 @test "foreign MCP entries survive install and removal" {
   set -eu -o pipefail
   # Both config files are shared with other add-ons (ddev-playwright-mcp writes
@@ -479,6 +552,20 @@ CHAIN
   assert_success
   run jq -r '.mcpServers.other.url' "${TESTDIR}/.mcp.json"
   assert_output "http://example:1/mcp"
+  run jq -r '.mcpServers["codebase-memory"] // "absent"' "${TESTDIR}/.mcp.json"
+  assert_output "absent"
+  run jq -r '.mcp["codebase-memory"] // "absent"' "${TESTDIR}/opencode.json"
+  assert_output "absent"
+
+  # ...and stays absent. The entrypoint's registration watchdog re-checks for about
+  # half a minute after container start, and used to put the entry back seconds after
+  # removal stripped it. Asserting only on the instant after `add-on remove` missed
+  # that completely, so wait out the whole window and read both files again.
+  #
+  # The container is deliberately still running here — removal retires the watchdog by
+  # deleting the compose file rather than by killing the container, matching how DDEV
+  # removes an add-on. So this is the assertion that has to hold.
+  sleep 40
   run jq -r '.mcpServers["codebase-memory"] // "absent"' "${TESTDIR}/.mcp.json"
   assert_output "absent"
   run jq -r '.mcp["codebase-memory"] // "absent"' "${TESTDIR}/opencode.json"

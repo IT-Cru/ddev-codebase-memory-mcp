@@ -72,6 +72,49 @@ post_install_actions:
     fi
 
   - |
+    #ddev-description:Mapping Drupal file extensions
+    # Drupal keeps real code in .module, .install, .theme and .profile files, and the
+    # indexer goes by extension — so hooks, schema and update functions, and theme
+    # preprocessors are all invisible to the graph by default. On a test project
+    # those files contributed 0 of 0 indexed functions before this mapping and 7 of 7
+    # after, call edges included.
+    #
+    # Only Drupal (and Backdrop, same file layout) needs the PHP part. WordPress,
+    # TYPO3 and Laravel put their code in .php, which is indexed already —
+    # .blade.php included, since it ends in .php.
+    #
+    # .twig is mapped as html so templates become searchable. search_code only looks
+    # inside indexed files, so without it "which templates call my custom Twig
+    # function?" finds the PHP definition and none of the call sites. Measured on a
+    # test project: 1 match before, 3 after. The cost is small and does not leak into
+    # code searches — templates become Module nodes, so search_graph --label
+    # Function/Class never returns them. html rather than a Twig grammar because the
+    # indexer has none, and an unknown language name is silently ignored.
+    case "${DDEV_PROJECT_TYPE:-}" in
+      drupal*|backdrop*)
+        CBM_CONFIG="${DDEV_APPROOT}/.codebase-memory.json"
+        if [ ! -e "$CBM_CONFIG" ]; then
+          cat > "$CBM_CONFIG" <<'EOF'
+    {
+      "extra_extensions": {
+        ".module": "php",
+        ".install": "php",
+        ".theme": "php",
+        ".profile": "php",
+        ".engine": "php",
+        ".inc": "php",
+        ".twig": "html"
+      }
+    }
+    EOF
+          echo "Created .codebase-memory.json (indexes Drupal .module/.install/.theme as PHP, .twig templates as HTML)"
+        else
+          echo "Kept existing .codebase-memory.json — add Drupal extensions yourself if you want them indexed"
+        fi
+        ;;
+    esac
+
+  - |
     #ddev-description:Seeding .cbmignore
     # Without this, DDEV's own config is indexed as if it were application code:
     # the shell functions in this add-on's entrypoint.sh alone accounted for most
@@ -120,6 +163,28 @@ post_install_actions:
     echo ""
 
 removal_actions:
+  - |
+    #ddev-description:Retiring the graph service
+    # Must run before the client configs are edited. The container's entrypoint
+    # re-checks the registration for about half a minute after start, so that a
+    # sibling add-on rewriting .mcp.json cannot drop our entry. That watchdog gives up
+    # once this compose file is gone — but the file is still present while
+    # removal_actions run, so a tick landing just after the next action strips the
+    # entry would put it straight back.
+    #
+    # Removing the file here retires the watchdog. DDEV deletes it again later along
+    # with the rest of project_files, which is harmless. The short settle covers a
+    # tick that had already passed the check and is mid-write: those take
+    # milliseconds, so a second is ample. The container itself is left running and
+    # simply not recreated on the next `ddev restart`, which is how DDEV's own
+    # removal behaves.
+    COMPOSE="${DDEV_APPROOT}/.ddev/docker-compose.codebase-memory.yaml"
+    if [ -f "$COMPOSE" ] && grep -q '#ddev-generated' "$COMPOSE"; then
+      rm -f "$COMPOSE"
+      echo "Retired the registration watchdog"
+      sleep 1
+    fi
+
   - |
     #ddev-description:Deregistering from AI client configs
     # Remove only our own key, and only from valid JSON, so hand-added MCP
