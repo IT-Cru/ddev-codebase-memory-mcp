@@ -474,6 +474,21 @@ PHPEOF
 <?php
 function mymod_update_10001() { return 'updated'; }
 PHPEOF
+  # A custom Twig function, defined in PHP and called from a template. Finding the
+  # call sites is only possible if templates are indexed — search_code looks inside
+  # indexed files only.
+  mkdir -p "${TESTDIR}/web/themes/custom/mytheme/templates" \
+           "${TESTDIR}/web/modules/custom/mymod/src"
+  cat > "${TESTDIR}/web/modules/custom/mymod/src/MyTwig.php" <<'PHPEOF'
+<?php
+namespace Drupal\mymod;
+class MyTwig {
+  public function getFunctions() { return ['mymod_badge' => 'x']; }
+}
+PHPEOF
+  cat > "${TESTDIR}/web/themes/custom/mytheme/templates/node.html.twig" <<'TWIGEOF'
+{% block content %}<div>{{ mymod_badge(node.id) }}</div>{% endblock %}
+TWIGEOF
 
   run ddev config --project-name="${PROJNAME}" --project-type=drupal11 --docroot=web
   assert_success
@@ -496,6 +511,20 @@ PHPEOF
   assert_output --partial "mymod_node_presave"
   assert_output --partial "mymod_helper_normalize"
   assert_output --partial "mymod_update_10001"
+
+  # Templates are indexed too, so a custom Twig function can be traced from its PHP
+  # definition to the templates that call it.
+  run jq -r '.extra_extensions[".twig"]' "${TESTDIR}/.codebase-memory.json"
+  assert_output "html"
+  run ddev cbm search_code --pattern mymod_badge
+  assert_success
+  assert_output --partial "MyTwig.php"
+  assert_output --partial "node.html.twig"
+
+  # ...without templates leaking into code-symbol searches.
+  run ddev cbm search_graph --label Function
+  assert_success
+  refute_output --partial ".twig"
 }
 
 @test "foreign MCP entries survive install and removal" {

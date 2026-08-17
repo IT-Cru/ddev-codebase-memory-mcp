@@ -240,16 +240,30 @@ and trace results.
 ### Drupal file extensions
 
 On a Drupal or Backdrop project, install writes a `.codebase-memory.json` mapping
-`.module`, `.install`, `.theme`, `.profile`, `.engine` and `.inc` to PHP. The indexer
-decides how to parse a file from its extension, so without that mapping every hook,
-schema and update function, and every theme preprocessor is missing from the graph —
-on a test project those files contributed **0 of 0** indexed functions before the
-mapping and **7 of 7** after, call edges included.
+`.module`, `.install`, `.theme`, `.profile`, `.engine` and `.inc` to PHP, and `.twig`
+to HTML.
 
-Other project types get nothing, deliberately. WordPress, TYPO3 and Laravel keep their
+The indexer decides how to parse a file from its extension, so without the PHP part
+every hook, schema and update function, and every theme preprocessor is missing from
+the graph — on a test project those files contributed **0 of 0** indexed functions
+before the mapping and **7 of 7** after, call edges included.
+
+The `.twig` part makes templates searchable. `search_code` only looks inside indexed
+files, so "which templates call my custom Twig function?" otherwise finds the PHP
+definition and none of the call sites — 1 match before the mapping, 3 after:
+
+```bash
+ddev cbm search_code --pattern my_custom_fn
+```
+
+Templates become `Module` nodes, so they never show up in `search_graph --label
+Function` or `--label Class`; the cost was 11 extra nodes for 3 templates. HTML rather
+than a Twig grammar because the indexer has none, and an unknown language name is
+silently ignored.
+
+Other project types get nothing, deliberately: WordPress, TYPO3 and Laravel keep their
 code in `.php`, which is indexed already — `.blade.php` included, since it ends in
-`.php`. Twig templates are left out because they define no functions or classes, so
-mapping them would add file nodes and little else.
+`.php`.
 
 Delete or edit the file if you disagree; it is only created when absent. To check what
 the graph is missing in your own project, ask for

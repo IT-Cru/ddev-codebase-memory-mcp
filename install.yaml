@@ -79,10 +79,17 @@ post_install_actions:
     # those files contributed 0 of 0 indexed functions before this mapping and 7 of 7
     # after, call edges included.
     #
-    # Only Drupal (and Backdrop, same file layout) needs this. WordPress, TYPO3 and
-    # Laravel put their code in .php, which is indexed already — .blade.php included,
-    # since it ends in .php. Twig templates are left out on purpose: they define no
-    # functions or classes, so mapping them adds file nodes and little else.
+    # Only Drupal (and Backdrop, same file layout) needs the PHP part. WordPress,
+    # TYPO3 and Laravel put their code in .php, which is indexed already —
+    # .blade.php included, since it ends in .php.
+    #
+    # .twig is mapped as html so templates become searchable. search_code only looks
+    # inside indexed files, so without it "which templates call my custom Twig
+    # function?" finds the PHP definition and none of the call sites. Measured on a
+    # test project: 1 match before, 3 after. The cost is small and does not leak into
+    # code searches — templates become Module nodes, so search_graph --label
+    # Function/Class never returns them. html rather than a Twig grammar because the
+    # indexer has none, and an unknown language name is silently ignored.
     case "${DDEV_PROJECT_TYPE:-}" in
       drupal*|backdrop*)
         CBM_CONFIG="${DDEV_APPROOT}/.codebase-memory.json"
@@ -95,11 +102,12 @@ post_install_actions:
         ".theme": "php",
         ".profile": "php",
         ".engine": "php",
-        ".inc": "php"
+        ".inc": "php",
+        ".twig": "html"
       }
     }
     EOF
-          echo "Created .codebase-memory.json (indexes Drupal .module/.install/.theme as PHP)"
+          echo "Created .codebase-memory.json (indexes Drupal .module/.install/.theme as PHP, .twig templates as HTML)"
         else
           echo "Kept existing .codebase-memory.json — add Drupal extensions yourself if you want them indexed"
         fi
