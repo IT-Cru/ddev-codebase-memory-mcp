@@ -583,12 +583,16 @@ class UIProxyMixin:
                 continue
             headers[key] = value
         headers["Host"] = authority
-        # The UI checks Origin against its own origin, the same DNS-rebinding
-        # defence as the Host check, and answers 403 to anything else — for the
-        # /assets/* bundle and every /api/* call alike. The asset tags carry
-        # `crossorigin`, so a browser always sends Origin, while curl sends none.
-        # Rewriting Host alone therefore looks perfectly healthy from the command
-        # line and renders a blank page in a browser.
+        # Keep this even though current upstream tolerates a foreign Origin: 0.10.3
+        # answered 403 to anything but its own, for the /assets/* bundle and every
+        # /api/* call alike, which rendered the UI as a blank page. CBM_VERSION is
+        # overridable, so a project pinned to such a release still needs the rewrite,
+        # and it costs nothing where the server does not care.
+        #
+        # Worth knowing if you are tempted to drop it: the asset tags carry
+        # `crossorigin`, so a browser always sends Origin while curl sends none —
+        # rewriting Host alone looks perfectly healthy from the command line and
+        # blank in a browser.
         if had_origin:
             headers["Origin"] = "http://%s" % authority
         # Accept-Encoding is dropped so the upstream reply is not compressed:

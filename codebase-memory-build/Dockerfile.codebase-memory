@@ -25,7 +25,7 @@ ARG USER_GID
 # Keep in step with the CBM_VERSION build arg in
 # docker-compose.codebase-memory.yaml, which is what takes effect under DDEV; this
 # default covers a direct `docker build`.
-ARG CBM_VERSION=v0.10.3
+ARG CBM_VERSION=v0.10.6
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV USERNAME=${USERNAME}
@@ -57,9 +57,10 @@ RUN python3 -c "import http.server, json, queue, subprocess, threading, uuid, so
 # Linux MUST use the "-portable" asset: the plain linux binary dynamically links
 # glibc 2.38+, while -portable is fully static. See upstream install.sh.
 #
-# One archive per platform, graph UI included. Upstream still publishes "ui-*"
-# copies so old updaters keep working, but those names are absent from
-# checksums.txt — verifying the download means using the canonical name.
+# One archive per platform since v0.10.0, graph UI included. Upstream also
+# publishes byte-identical "ui-*" copies so older updaters keep working; those were
+# missing from checksums.txt until v0.10.5, which is what broke this build. They are
+# covered now, with the same digest, but the canonical name is the one to depend on.
 #
 # The binary is placed directly on PATH rather than via `<binary> install`,
 # which would also rewrite agent configs and manage a host PATH we do not want
